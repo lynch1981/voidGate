@@ -47,6 +47,31 @@ sudo ./voidgatectl disarm
 
 Prometheus: `http://127.0.0.1:9105/metrics`
 
+Use `-d` to detach and run in the background:
+
+```sh
+sudo ./voidgate -d -c configs/voidgate.conf
+sudo ./voidgate -s stop
+```
+
+The command waits for startup before returning success and printing the daemon
+PID to stderr. Startup failures return nonzero; after detachment, diagnostic
+details are in the log file. SIGTERM shuts down the daemon and detaches XDP.
+The supplied systemd service continues running in the foreground.
+
+`log_file` in the configuration selects the append-only log. Omit the key for
+`/var/log/voidgate.log`. Files are created with mode `0640` subject to
+the process umask; parent directories must already exist. `pid_file` is
+`/run/voidgate.pid` when omitted; `-s stop` reads it. Relative log, pid, and
+config paths use the launch directory, which the daemon retains for
+configuration reloads. `-v` and `-vv` retain their usual verbosity. Restart
+voidgate after rotating the log file or changing its destination; configuration
+reload does not reopen logs or move the pid file.
+
+Run `make test-daemon` to test daemon startup and logging in isolated mount,
+network and PID namespaces (requires sudo and BPF support). It is included in
+`make test`.
+
 Edit `interface` in the config to the VM's public NIC. Do not point this
 at a shared management-only interface you cannot afford to XDP-attach;
 the idle path is `XDP_PASS`, but attach still requires driver/SKB XDP.
@@ -112,12 +137,20 @@ The protocol is one newline-terminated command per connection, followed by a
 text response and connection close. Commands are limited to 254 bytes before
 the newline. The server also accepts a command terminated by a write-side EOF.
 
-Run the control protocol and Lua integration tests without root or BPF:
+Run the Lua control tests against an isolated real daemon (requires sudo,
+BPF support, Bash, coreutils, iproute2, util-linux, Lua, and LuaSocket):
 
 ```sh
-make test-ctl
 make test-lua LUA=lua5.4
 ```
+
+The Bash runner creates private network and mount namespaces, a temporary
+veth pair, and a private `/run/voidgate.sock`. It stops the daemon and removes
+temporary files after the test. After building both binaries, it can also
+be run directly with `bash tests/test_lua.sh lua5.4`. `make test` includes
+this test.
+`LUA` accepts an interpreter followed by whitespace-separated arguments
+(for example, `LUA="lua5.4 -E"`); shell quoting within that value is not parsed.
 
 ## How it decides
 

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,6 +28,10 @@ static void on_signal(int sig);
 static void sock_timeout(int fd);
 static long elapsed_ms(const struct timespec *a, const struct timespec *b);
 static void usage(const char *argv0);
+static void redirect_log(int fd);
+static int daemon_start(int log_fd);
+static void write_pidfile(const char *path);
+static void daemon_stop(const char *path);
 
 static volatile sig_atomic_t g_stop;
 
@@ -59,7 +64,186 @@ elapsed_ms(const struct timespec *a, const struct timespec *b)
 static void
 usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s [-c config] [-i iface] [-v|-vv]\n", argv0);
+    fprintf(stderr,
+            "usage: %s [-d] [-s stop] [-c config] [-i iface] [-v|-vv]\n",
+            argv0);
+}
+
+
+static void
+redirect_log(int fd)
+{
+    if (dup2(fd, STDERR_FILENO) < 0) {
+        vg_die("redirect log: %s", strerror(errno));
+    }
+
+    if (fd != STDERR_FILENO) {
+        close(fd);
+    }
+}
+
+
+/* Return the readiness pipe in the daemon; the original parent exits. */
+static int
+daemon_start(int log_fd)
+{
+    int      fd, pipefd[2];
+    pid_t    child, daemon_pid;
+    ssize_t  n;
+
+    /* Keep pipe descriptors above stderr even if the caller closed stdio. */
+    for (fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+        if (fcntl(fd, F_GETFD) < 0) {
+            if (errno != EBADF || open("/dev/null", O_RDWR) < 0) {
+                vg_die("reserve standard streams: %s", strerror(errno));
+            }
+        }
+    }
+
+    if (pipe(pipefd) < 0) {
+        vg_die("startup pipe: %s", strerror(errno));
+    }
+
+    fflush(NULL);
+    child = fork();
+
+    if (child < 0) {
+        vg_die("fork: %s", strerror(errno));
+    }
+
+    if (child > 0) {
+        close(pipefd[1]);
+        close(log_fd);
+
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { /* void */ }
+
+        do {
+            n = read(pipefd[0], &daemon_pid, sizeof(daemon_pid));
+        } while (n < 0 && errno == EINTR);
+
+        close(pipefd[0]);
+
+        if (n != sizeof(daemon_pid)) {
+            vg_die("daemon startup failed; check the log file");
+        }
+
+        fprintf(stderr, "voidgate daemon started (pid %ld)\n",
+                (long) daemon_pid);
+        exit(0);
+    }
+
+    close(pipefd[0]);
+    redirect_log(log_fd);
+
+    if (setsid() < 0) {
+        vg_die("setsid: %s", strerror(errno));
+    }
+
+    child = fork();
+
+    if (child < 0) {
+        vg_die("fork: %s", strerror(errno));
+    }
+
+    if (child > 0) {
+        _exit(0);
+    }
+
+    fd = open("/dev/null", O_RDWR);
+
+    if (fd < 0) {
+        vg_die("open /dev/null: %s", strerror(errno));
+    }
+
+    if (dup2(fd, STDIN_FILENO) < 0 || dup2(fd, STDOUT_FILENO) < 0) {
+        vg_die("redirect standard streams: %s", strerror(errno));
+    }
+
+    if (fd > STDERR_FILENO) {
+        close(fd);
+    }
+
+    /* Keep cwd so relative config paths still work on reload. */
+    return pipefd[1];
+}
+
+
+static void
+write_pidfile(const char *path)
+{
+    char buf[32];
+    int fd, n;
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (fd < 0) {
+        vg_die("open pid file %s: %s", path, strerror(errno));
+    }
+
+    n = snprintf(buf, sizeof(buf), "%ld\n", (long) getpid());
+
+    if (write(fd, buf, (size_t) n) != n) {
+        close(fd);
+        unlink(path);
+        vg_die("write pid file %s: %s", path, strerror(errno));
+    }
+
+    close(fd);
+}
+
+
+static void
+daemon_stop(const char *path)
+{
+    char buf[32];
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+    ssize_t n;
+    long pid;
+    int fd, i;
+
+    fd = open(path, O_RDONLY);
+
+    if (fd < 0) {
+        vg_die("open pid file %s: %s", path, strerror(errno));
+    }
+
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0) {
+        vg_die("read pid file %s: %s", path,
+               n < 0 ? strerror(errno) : "empty");
+    }
+
+    buf[n] = '\0';
+    pid = strtol(buf, NULL, 10);
+
+    if (pid <= 0) {
+        vg_die("bad pid file %s", path);
+    }
+
+    if (kill((pid_t) pid, SIGTERM) < 0) {
+        if (errno == ESRCH) {
+            unlink(path);
+        }
+
+        vg_die("stop pid %ld: %s", pid, strerror(errno));
+    }
+
+    for (i = 0; i < 200; i++) {
+        if (kill((pid_t) pid, 0) < 0) {
+            if (errno == ESRCH) {
+                unlink(path);
+                return;
+            }
+
+            vg_die("stop pid %ld: %s", pid, strerror(errno));
+        }
+
+        nanosleep(&delay, NULL);
+    }
+
+    vg_die("stop pid %ld: timed out", pid);
 }
 
 
@@ -72,10 +256,11 @@ main(int argc, char **argv)
     const char *cfg_path = "/etc/voidgate/voidgate.conf";
     const char *iface_ov = NULL;
     int opt, ctl_fd = -1, http_fd = -1;
+    int daemon_mode = 0, stop_mode = 0, log_fd, ready_fd = -1, result = 0;
     struct sigaction sa;
     struct timespec last_tick;
 
-    while ((opt = getopt(argc, argv, "c:i:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "c:i:ds:hv")) != -1) {
         switch (opt) {
         case 'c':
             cfg_path = optarg;
@@ -88,6 +273,17 @@ main(int argc, char **argv)
                 vg_verbose++;
             }
             break;
+        case 'd':
+            daemon_mode = 1;
+            break;
+        case 's':
+            if (strcmp(optarg, "stop") != 0) {
+                usage(argv[0]);
+                return 1;
+            }
+
+            stop_mode = 1;
+            break;
         default:
             usage(argv[0]);
             return 1;
@@ -98,12 +294,30 @@ main(int argc, char **argv)
         vg_die("failed to load config %s", cfg_path);
     }
 
+    if (stop_mode) {
+        daemon_stop(cfg.pid_file);
+        return 0;
+    }
+
     if (iface_ov != NULL) {
         snprintf(cfg.interface, sizeof(cfg.interface), "%s", iface_ov);
     }
 
     if (if_nametoindex(cfg.interface) == 0) {
         vg_die("unknown interface %s", cfg.interface);
+    }
+
+    log_fd = open(cfg.log_file, O_WRONLY | O_CREAT | O_APPEND, 0640);
+
+    if (log_fd < 0) {
+        vg_die("open log %s: %s", cfg.log_file, strerror(errno));
+    }
+
+    if (daemon_mode) {
+        ready_fd = daemon_start(log_fd);
+
+    } else {
+        redirect_log(log_fd);
     }
 
     memset(&sa, 0, sizeof(sa));
@@ -158,6 +372,22 @@ main(int argc, char **argv)
     vg_log("idle on %s, wake_pps=%llu wake_mbps=%llu", cfg.interface,
            (unsigned long long)cfg.wake_pps,
            (unsigned long long)cfg.wake_mbps);
+
+    write_pidfile(cfg.pid_file);
+
+    if (ready_fd >= 0) {
+        pid_t daemon_pid = getpid();
+
+        if (write(ready_fd, &daemon_pid, sizeof(daemon_pid))
+            != sizeof(daemon_pid))
+        {
+            vg_warn("failed to report daemon readiness");
+            g_stop = 1;
+            result = 1;
+        }
+
+        close(ready_fd);
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &last_tick);
     while (!g_stop) {
@@ -237,6 +467,8 @@ main(int argc, char **argv)
     vg_ctrl_free(&ctrl);
     vg_maps_close(&maps);
 
+    unlink(cfg.pid_file);
+
     if (ctl_fd >= 0) {
         close(ctl_fd);
         unlink(VG_SOCK_PATH);
@@ -247,5 +479,5 @@ main(int argc, char **argv)
     }
 
     vg_log("exit");
-    return 0;
+    return result;
 }
