@@ -71,17 +71,13 @@ sum_scratch_need(int ncpus)
 
 
 int
-vg_maps_open(struct vg_maps *m, struct vg_config_file *cfg)
+vg_maps_open(struct vg_maps *m, struct vg_config *cfg)
 {
     int err;
 
     memset(m, 0, sizeof(*m));
 
     m->ifindex = (int) if_nametoindex(cfg->interface);
-
-    if (m->ifindex == 0) {
-        vg_die("unknown interface %s", cfg->interface);
-    }
 
     bump_memlock();
     libbpf_set_print(libbpf_print);
@@ -152,7 +148,7 @@ vg_maps_close(struct vg_maps *m)
 
 
 int
-vg_xdp_attach(struct vg_maps *m, const struct vg_config_file *cfg)
+vg_xdp_attach(struct vg_maps *m, const struct vg_config *cfg)
 {
     int prog_fd;
     uint32_t flags;
@@ -308,10 +304,10 @@ vg_remote_foreach(struct vg_maps *m, uint32_t budget, vg_remote_pt fn,
 
 int
 vg_cfg_commit(struct vg_maps *m, uint32_t armed,
-    const struct vg_config_file *cfg)
+    const struct vg_config *cfg)
 {
     __u32 key = 0;
-    struct vg_config bc;
+    struct vg_cfg bc;
     int i, fd;
 
     memset(&bc, 0, sizeof(bc));
@@ -542,7 +538,7 @@ local_cidr_from_nic(const char *nic, struct vg_cidr *out, int max)
 
 
 int
-vg_populate_local(struct vg_maps *m, struct vg_config_file *cfg)
+vg_populate_local(struct vg_maps *m, struct vg_config *cfg)
 {
     int i, fd4, fd6;
     uint8_t one = 1;
@@ -583,7 +579,7 @@ vg_populate_local(struct vg_maps *m, struct vg_config_file *cfg)
 
 
 int
-vg_populate_allow(struct vg_maps *m, const struct vg_config_file *cfg)
+vg_populate_allow(struct vg_maps *m, const struct vg_config *cfg)
 {
     int i, fd4, fd6;
     uint8_t one = 1;
