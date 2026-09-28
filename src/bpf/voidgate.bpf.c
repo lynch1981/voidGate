@@ -20,7 +20,10 @@ static __always_inline int v6_in_lpm(void *map, const __u8 addr[16]);
 static __always_inline int v6_is_linklocal(const __u8 addr[16]);
 static __always_inline int v6_is_mcast_link(const __u8 addr[16]);
 static __always_inline void acc_in(struct host_counters *c, __u64 bytes);
-static __always_inline int dhcp_ports(__u16 sport, __u16 dport);
+static __always_inline int v4_dhcp_allowed(__be32 daddr, __u16 sport,
+    __u16 dport);
+static __always_inline int v6_dhcp_allowed(const __u8 daddr[16],
+    __u16 sport, __u16 dport);
 static __always_inline int v4_tcp_allowed(const struct vg_cfg *c,
     __be32 saddr, __be32 daddr, __u16 sport, __u16 dport);
 static __always_inline int v6_tcp_allowed(const struct vg_cfg *c,
@@ -253,11 +256,37 @@ acc_in(struct host_counters *c, __u64 bytes)
 }
 
 
+/* Allow DHCP only as an exact client/server port pair aimed at this VM.
+ * Client: server or relay 67 -> 68. Server: client 68 or relay 67 -> 67.
+ * Dest must be local or 255.255.255.255 (no lease yet). A remote source
+ * port of 67/68 alone is not a whitelist hit.
+ */
 static __always_inline int
-dhcp_ports(__u16 sport, __u16 dport)
+v4_dhcp_allowed(__be32 daddr, __u16 sport, __u16 dport)
 {
-    return dport == 67 || dport == 68 || sport == 67 || sport == 68
-           || dport == 546 || dport == 547 || sport == 546 || sport == 547;
+    if (!((dport == 68 && sport == 67)
+          || (dport == 67 && (sport == 68 || sport == 67))))
+    {
+        return 0;
+    }
+
+    return daddr == 0xffffffff || v4_in_lpm(&local_v4, daddr);
+}
+
+
+/* DHCPv6 client: server 547 -> 546. Server: client 546 or relay 547 -> 547.
+ * Link-local and ff02:: dests already pass; here dest must be local.
+ */
+static __always_inline int
+v6_dhcp_allowed(const __u8 daddr[16], __u16 sport, __u16 dport)
+{
+    if (!((dport == 546 && sport == 547)
+          || (dport == 547 && (sport == 546 || sport == 547))))
+    {
+        return 0;
+    }
+
+    return v6_in_lpm(&local_v6, daddr);
 }
 
 
@@ -537,7 +566,9 @@ voidgate_xdp(struct xdp_md *ctx)
             goto v4_count;
         }
 
-        if (proto == VG_IPPROTO_UDP && dhcp_ports(sport, dport)) {
+        if (proto == VG_IPPROTO_UDP
+            && v4_dhcp_allowed(daddr, sport, dport))
+        {
             goto v4_count;
         }
 
@@ -617,7 +648,9 @@ voidgate_xdp(struct xdp_md *ctx)
             goto v6_count;
         }
 
-        if (proto == VG_IPPROTO_UDP && dhcp_ports(sport, dport)) {
+        if (proto == VG_IPPROTO_UDP
+            && v6_dhcp_allowed(daddr.addr, sport, dport))
+        {
             goto v6_count;
         }
 
