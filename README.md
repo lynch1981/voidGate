@@ -143,7 +143,7 @@ BPF support, Bash, coreutils, iproute2, util-linux, Lua, and LuaSocket):
 sudo bash tests/test_lua.sh
 ```
 
-The Bash runner creates private network and mount namespaces, a temporary
+The Bash runner creates private network, mount and PID namespaces, a temporary
 veth pair, and a private `/run/voidgate.sock`. It stops the daemon and removes
 temporary files after the test. Build `voidgate` and `voidgatectl` first.
 The runner uses `lua` from `PATH`.
