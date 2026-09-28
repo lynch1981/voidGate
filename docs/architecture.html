@@ -97,7 +97,7 @@
             <li><strong>IPv6 hard-pass</strong> — <code>fe80::/10</code>, <code>ff02::/16</code>, and ICMPv6 NDP types 133–137 skip the drop tree. IPv4 has no extra hard-pass here; link-local v4 is an allow-list entry.</li>
             <li><strong>Allow LPM</strong> — source or destination in <code>allow_v4</code> / <code>allow_v6</code> skips the drop tree.</li>
             <li><strong>TCP allow_ports</strong> — only when the <em>local</em> side is that port: <code>dport</code> and dest in <code>local_*</code>, or <code>sport</code> and src in <code>local_*</code>. A remote source port of 22 is not a whitelist hit.</li>
-            <li><strong>DHCP</strong> — UDP 67/68 and DHCPv6 546/547.</li>
+            <li><strong>DHCP</strong> — exact port pair to this VM: UDP 67→68 or 68/67→67, DHCPv6 547→546 or 546/547→547. A remote source port alone is not a whitelist.</li>
             <li class="drop-step"><strong>Drop LPM</strong> — source or destination in <code>drop_v4</code> / <code>drop_v6</code> returns <code>XDP_DROP</code>.</li>
             <li><strong>Count, then pass</strong> — inbound to a local dest updates <code>host_*</code> and <code>remote_*</code>; outbound from a local src updates <code>host_*</code>.</li>
         </ol>

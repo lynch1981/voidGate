@@ -47,8 +47,10 @@ binaries.
 4. **Whitelist / NDP / SSH before drop.** Never drop IPv6 NDP (types
    133–137), `fe80::/10`, `ff02::/16`, TCP `allow_ports` when the
    **local** side is that port (`dport` + dest in `local_*`, or `sport` +
-   src in `local_*`), DHCP UDP 67/68 (and DHCPv6 546/547). A remote
-   source port of 22 is not a whitelist. Userspace must refuse a drop
+   src in `local_*`), DHCP as an exact port pair to a local (or v4
+   broadcast) dest: UDP 67→68 or 68/67→67, DHCPv6 547→546 or
+   546/547→547. A remote source port of 22, 67, 68, 546 or 547 alone is
+   not a whitelist. Userspace must refuse a drop
    CIDR that covers `local_*` or `allow_*`.
 5. **Do not blackhole the VM.** Drop attacker prefixes, not the local
    interface CIDR.

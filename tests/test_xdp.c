@@ -621,6 +621,7 @@ test_v6_extensions(struct voidgate_bpf *skel)
            "extension before non-first fragment does not expose ports");
 
     len = craft_v6_udp(pkt, sizeof(pkt), "2001:db8::bad", "2001:db8::10");
+    ((struct vg_udphdr *) (pkt + 54))->source = htons(546);
     ((struct vg_udphdr *) (pkt + 54))->dest = htons(547);
     len = prepend_ext(pkt, len, VG_IPPROTO_DSTOPTS, sizeof(pkt));
     len = prepend_ext(pkt, len, VG_IPPROTO_HOPOPTS, sizeof(pkt));
@@ -700,10 +701,47 @@ main(void)
     expect(rc == 0 && rv == XDP_DROP,
            "TCP sport 22 from dropped src is not a whitelist");
 
+    len = craft_v4_udp(pkt, sizeof(pkt), "203.0.113.1", "198.51.100.10", 67,
+                       68);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_PASS,
+           "DHCP server reply 67->68 to local passes from dropped src");
+
+    len = craft_v4_udp(pkt, sizeof(pkt), "203.0.113.1", "255.255.255.255", 67,
+                       68);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_PASS,
+           "DHCP server reply 67->68 to broadcast passes");
+
+    len = craft_v4_udp(pkt, sizeof(pkt), "203.0.113.1", "198.51.100.10", 68,
+                       67);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_PASS,
+           "DHCP client request 68->67 to local passes");
+
+    len = craft_v4_udp(pkt, sizeof(pkt), "203.0.113.1", "198.51.100.10", 68,
+                       80);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_DROP,
+           "UDP sport 68 from dropped src is not a whitelist");
+
+    len = craft_v4_udp(pkt, sizeof(pkt), "203.0.113.1", "198.51.100.10", 67,
+                       80);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_DROP,
+           "UDP sport 67 from dropped src is not a whitelist");
+
     len = craft_v4_udp(pkt, sizeof(pkt), "203.0.113.1", "198.51.100.10", 12345,
                        67);
     rc = run_pkt(skel, pkt, len, &rv);
-    expect(rc == 0 && rv == XDP_PASS, "DHCP UDP 67 passes from dropped src");
+    expect(rc == 0 && rv == XDP_DROP,
+           "UDP dport 67 from a non-DHCP port is not a whitelist");
+
+    len = craft_v4_udp(pkt, sizeof(pkt), "203.0.113.1", "198.51.100.77", 67,
+                       68);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_DROP,
+           "DHCP ports to a non-local unicast dest are not a whitelist");
 
     len = craft_v4_udp_vlan(pkt, sizeof(pkt), "203.0.113.1", "198.51.100.10",
                             12345, 80);
@@ -745,6 +783,23 @@ main(void)
     rc = run_pkt(skel, pkt, len, &rv);
     expect(rc == 0 && rv == XDP_DROP,
            "IPv6 TCP sport 22 from dropped src is not a whitelist");
+
+    len = craft_v6_udp(pkt, sizeof(pkt), "2001:db8::bad", "2001:db8::10");
+    ((struct vg_udphdr *) (pkt + 54))->source = htons(547);
+    ((struct vg_udphdr *) (pkt + 54))->dest = htons(546);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_PASS,
+           "DHCPv6 server reply 547->546 to local passes from dropped src");
+
+    ((struct vg_udphdr *) (pkt + 54))->dest = htons(80);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_DROP,
+           "UDP sport 547 from dropped IPv6 src is not a whitelist");
+
+    ((struct vg_udphdr *) (pkt + 54))->source = htons(546);
+    rc = run_pkt(skel, pkt, len, &rv);
+    expect(rc == 0 && rv == XDP_DROP,
+           "UDP sport 546 from dropped IPv6 src is not a whitelist");
 
     test_v6_extensions(skel);
 
