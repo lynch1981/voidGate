@@ -68,6 +68,15 @@ configuration reloads. `-v` and `-vv` retain their usual verbosity. Restart
 voidgate after rotating the log file or changing its destination; configuration
 reload does not reopen logs or move the pid file.
 
+Only one daemon runs at a time. It holds a lock on the pid file for its whole
+life, and a second `voidgate` exits with `already running (pid N, <pid_file>)`
+before touching the NIC or the control socket. A second instance with a
+different `pid_file` is refused too while another daemon answers on
+`/run/voidgate.sock`. After a crash the lock is released by the kernel, so a
+restart takes over the leftover socket and XDP program. `-s stop` refuses a
+pid file that no running daemon holds (`is stale: voidgate is not running`),
+removes it, and never signals the pid inside.
+
 Run `sudo t/integration/daemon.sh` to test daemon startup and logging in
 isolated mount, network and PID namespaces (requires sudo and BPF support).
 

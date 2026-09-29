@@ -131,6 +131,57 @@ for mode in default config; do
     stop_daemon
 done
 
+# A second instance must fail without touching the first one's socket,
+# XDP program or pid file.
+start_daemon -c base.conf
+first=$pid
+
+second_instance() {
+    local result=0
+    timeout --kill-after=2 10 "$root/voidgate" -d "$@" \
+        > second.out 2> second.err || result=$?
+    [[ $result == 1 ]]
+    kill -0 "$first"
+    [[ $(< /run/voidgate.pid) == "$first" ]]
+    [[ -S /run/voidgate.sock ]]
+    status
+    [[ $(ip -details link show test0) == *prog/xdp* ]]
+}
+
+second_instance -c base.conf
+grep -q "already running (pid $first, /run/voidgate.pid)" second.err
+# Another pid file does not help: the control socket is still in use.
+cp base.conf other-pid.conf
+printf 'pid_file = %s\n' "$directory/other.pid" >> other-pid.conf
+second_instance -c other-pid.conf
+grep -q 'already serving /run/voidgate.sock' second.err
+[[ ! -e other.pid ]]
+stop_daemon
+
+# After a crash the pid file, socket file and XDP program are left behind,
+# but the lock died with the process: a restart must take over cleanly.
+start_daemon -c base.conf
+kill -KILL "$pid"
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 0.05
+done
+[[ -e /run/voidgate.pid && -S /run/voidgate.sock ]]
+start_daemon -c base.conf
+stop_daemon
+
+# A stale pid file (no daemon holds its lock) must not signal that pid.
+sleep 60 &
+bystander=$!
+printf '%s\n' "$bystander" > /run/voidgate.pid
+result=0
+"$root/voidgate" -s stop -c base.conf 2> stale.err || result=$?
+[[ $result == 1 ]]
+grep -q 'not running' stale.err
+kill -0 "$bystander"
+[[ ! -e /run/voidgate.pid ]]
+kill "$bystander"
+wait "$bystander" 2>/dev/null || true
+
 # Fail before forking for bad config and unusable/invalid log paths.
 cp base.conf invalid.conf
 printf 'wake_pps = invalid\n' >> invalid.conf

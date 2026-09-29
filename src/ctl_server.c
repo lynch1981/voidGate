@@ -260,6 +260,29 @@ ctl_reload(struct vg_ctrl *ctrl, const char *args, char *reply,
 
 
 int
+vg_ctl_server_alive(const char *path)
+{
+    struct sockaddr_un addr;
+    int fd, alive;
+
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    if (fd < 0) {
+        return 0;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+    /* A leftover socket file from a crash refuses; a daemon accepts. */
+    alive = connect(fd, (struct sockaddr *) &addr, sizeof(addr)) == 0;
+    close(fd);
+    return alive;
+}
+
+
+int
 vg_ctl_server_listen(const char *path)
 {
     struct sockaddr_un addr;

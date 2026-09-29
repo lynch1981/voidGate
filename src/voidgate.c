@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -29,7 +30,8 @@ static long elapsed_ms(const struct timespec *a, const struct timespec *b);
 static void usage(const char *argv0);
 static void redirect_log(int fd);
 static int daemon_start(int log_fd);
-static void write_pidfile(const char *path);
+static int pid_lock(const char *path);
+static void write_pidfile(int fd, const char *path);
 static void daemon_stop(const char *path);
 
 static volatile sig_atomic_t g_stop;
@@ -146,27 +148,51 @@ daemon_start(int log_fd)
 }
 
 
-static void
-write_pidfile(const char *path)
+/* Hold an exclusive flock on the pid file for the daemon's lifetime: one
+ * instance per pid file, released by the kernel even on a crash. Taken
+ * before the fork, so the lock passes to the daemon with the fd.
+ */
+static int
+pid_lock(const char *path)
 {
     char buf[32];
-    int fd, n;
+    ssize_t n;
+    int fd;
 
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
 
     if (fd < 0) {
         vg_die("open pid file %s: %s", path, strerror(errno));
     }
 
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        return fd;
+    }
+
+    if (errno != EWOULDBLOCK) {
+        vg_die("lock pid file %s: %s", path, strerror(errno));
+    }
+
+    n = pread(fd, buf, sizeof(buf) - 1, 0);
+    buf[n > 0 ? n : 0] = '\0';
+    buf[strcspn(buf, "\n")] = '\0';
+    vg_die("voidgate already running (pid %s, %s)",
+           buf[0] != '\0' ? buf : "?", path);
+}
+
+
+static void
+write_pidfile(int fd, const char *path)
+{
+    char buf[32];
+    int n;
+
     n = snprintf(buf, sizeof(buf), "%ld\n", (long) getpid());
 
-    if (write(fd, buf, (size_t) n) != n) {
-        close(fd);
+    if (ftruncate(fd, 0) < 0 || pwrite(fd, buf, (size_t) n, 0) != n) {
         unlink(path);
         vg_die("write pid file %s: %s", path, strerror(errno));
     }
-
-    close(fd);
 }
 
 
@@ -186,6 +212,16 @@ daemon_stop(const char *path)
     }
 
     n = read(fd, buf, sizeof(buf) - 1);
+
+    /* A live daemon holds LOCK_EX. If we can lock it, the pid inside is
+     * stale and may belong to an unrelated process: never signal it.
+     */
+    if (flock(fd, LOCK_SH | LOCK_NB) == 0) {
+        close(fd);
+        unlink(path);
+        vg_die("pid file %s is stale: voidgate is not running", path);
+    }
+
     close(fd);
 
     if (n <= 0) {
@@ -235,6 +271,7 @@ main(int argc, char **argv)
     const char *iface_ov = NULL;
     int opt, ctl_fd = -1, http_fd = -1;
     int daemon_mode = 0, stop_mode = 0, log_fd, ready_fd = -1, result = 0;
+    int pid_fd;
     struct sigaction sa;
     struct timespec last_tick;
 
@@ -275,6 +312,17 @@ main(int argc, char **argv)
     if (stop_mode) {
         daemon_stop(cfg.pid_file);
         return 0;
+    }
+
+    /* Before anything shared is touched: attach replaces any XDP program on
+     * the NIC and listen unlinks the socket path, so a second instance
+     * would silently take over (and detach on exit) the first one's.
+     */
+    pid_fd = pid_lock(cfg.pid_file);
+
+    if (vg_ctl_server_alive(VG_SOCK_PATH)) {
+        unlink(cfg.pid_file);
+        vg_die("another voidgate is already serving %s", VG_SOCK_PATH);
     }
 
     if (iface_ov != NULL) {
@@ -355,7 +403,7 @@ main(int argc, char **argv)
            (unsigned long long)cfg.wake_pps,
            (unsigned long long)cfg.wake_mbps);
 
-    write_pidfile(cfg.pid_file);
+    write_pidfile(pid_fd, cfg.pid_file);
 
     if (ready_fd >= 0) {
         pid_t daemon_pid = getpid();
@@ -449,8 +497,6 @@ main(int argc, char **argv)
     vg_ctrl_free(&ctrl);
     vg_maps_close(&maps);
 
-    unlink(cfg.pid_file);
-
     if (ctl_fd >= 0) {
         close(ctl_fd);
         unlink(VG_SOCK_PATH);
@@ -459,6 +505,12 @@ main(int argc, char **argv)
     if (http_fd >= 0) {
         close(http_fd);
     }
+
+    /* Last: once the lock is gone a new instance may start, and XDP and the
+     * socket must already be released by then.
+     */
+    unlink(cfg.pid_file);
+    close(pid_fd);
 
     vg_log("exit");
     return result;
