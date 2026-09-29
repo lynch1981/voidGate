@@ -531,25 +531,25 @@ voidgate_xdp(struct xdp_md *ctx)
             return parse_fail(m);
         }
 
-        ihl = ip->ver_ihl & 0x0f;
-
-        if (ihl < 5) {
-            return parse_fail(m);
-        }
-
-        l4 = (void *) ip + (ihl << 2);
-
-        if (l4 > data_end) {
-            return parse_fail(m);
-        }
-
         saddr = ip->saddr;
         daddr = ip->daddr;
         proto = ip->protocol;
+        ihl = ip->ver_ihl & 0x0f;
+        l4 = (void *) ip + (ihl << 2);
         first_frag = (bpf_ntohs(ip->frag_off) & 0x1fff) == 0;
 
-        if (first_frag
-            && parse_l4(l4, data_end, proto, &sport, &dport, NULL) < 0)
+        /* A bad IHL still leaves the fixed 20-byte header, and so both
+         * addresses, readable: count it and fall through with no ports,
+         * like a truncated IPv6 extension. The drop LPM still applies;
+         * port exemptions cannot, since there is no trustworthy L4.
+         */
+        if (ihl < 5 || l4 > data_end) {
+            if (m != NULL) {
+                m->parse_err++;
+            }
+
+        } else if (first_frag
+                   && parse_l4(l4, data_end, proto, &sport, &dport, NULL) < 0)
         {
             if (m != NULL) {
                 m->parse_err++;

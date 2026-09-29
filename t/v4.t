@@ -105,3 +105,34 @@ __DATA__
 --- packets: ipv4 udp 198.51.100.8:12345 > 198.51.100.10:80
 --- verdict: XDP_PASS
 --- counters: rx_pkts=1 passed=1 dropped=0
+
+
+
+=== TEST 15: IHL below 5 from dropped src is XDP_DROP
+--- setup: drop 203.0.113.1/32
+--- packets: ipv4 udp 203.0.113.1:12345 > 198.51.100.10:80 set@14=68
+--- verdict: XDP_DROP
+--- counters: rx_pkts=1 dropped=1 parse_err=1
+
+
+
+=== TEST 16: IHL past the frame end from dropped src is XDP_DROP
+--- setup: drop 203.0.113.1/32
+--- packets: ipv4 udp 203.0.113.1:12345 > 198.51.100.10:80 set@14=79
+--- verdict: XDP_DROP
+--- counters: rx_pkts=1 dropped=1 parse_err=1
+
+
+
+=== TEST 17: bad IHL cannot expose the SSH exemption
+--- setup: drop 203.0.113.1/32
+--- packets: ipv4 tcp 203.0.113.1:40000 > 198.51.100.10:22 set@14=79
+--- verdict: XDP_DROP
+
+
+
+=== TEST 18: bad IHL from a non-dropped src still passes
+--- setup: drop 203.0.113.1/32
+--- packets: ipv4 udp 198.51.100.8:12345 > 198.51.100.10:80 set@14=68
+--- verdict: XDP_PASS
+--- counters: rx_pkts=1 dropped=0 parse_err=1
