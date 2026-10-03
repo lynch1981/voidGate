@@ -282,12 +282,34 @@ vg.new({ path = "/run/voidgate.sock", timeout = 1 })   -- seconds
 and reads with `receive("*a")` until the daemon closes. No keepalive pool:
 the protocol is one command per connection.
 
-**Phases.** Cosockets yield, so the methods run only in `rewrite`,
-`access`, `content` and timer context. `ban()` covers every other phase: it
-validates its input, queues `ngx.timer.at(0, ...)` to make the call from
-timer context, and returns `true` at once. The daemon's answer goes to the
-nginx error log, never to the request. Kong and APISIX plugins call it the
-same way from their `log` handler.
+**Phases.** Plain Lua runs in every phase; what ngx_lua restricts per phase
+is I/O. The methods (`drop`, `status`, ...) talk to the daemon over a
+cosocket, which yields, so they run only where cosockets are allowed.
+`ban()` does no I/O itself: it validates its input, does a shared-dict
+`add` and queues `ngx.timer.at(0, ...)`, then returns `true` at once. The
+daemon request runs later in timer context, where cosockets are allowed,
+and its answer goes to the nginx error log, never to the request.
+
+| Context | Methods (cosocket) | `ban()` (`ngx.timer.at`) |
+|---|---|---|
+| `rewrite_by_lua*`, `access_by_lua*`, `content_by_lua*` | yes | yes |
+| `ngx.timer.*` callbacks | yes | yes |
+| `log_by_lua*` | no | yes |
+| `header_filter_by_lua*`, `body_filter_by_lua*` | no | yes |
+| `set_by_lua*`, `balancer_by_lua*` | no | yes |
+| `init_worker_by_lua*` | no | yes |
+| `init_by_lua*` (master process) | no | no |
+
+- Call a method when the caller needs the daemon's answer, for example
+  in `access_by_lua*` or a timer; call `ban()` from anywhere else. Any
+  Lua logic can call either: a `log_by_lua*` counter, a Kong or APISIX
+  plugin's `log` handler, or another library's callback.
+- A periodic aggregator inside OpenResty is a timer: start it with
+  `ngx.timer.every` from `init_worker_by_lua*`, and call the methods
+  directly from its callback.
+- Blocking I/O (LuaSocket, `io.*`) is not forbidden, but it stalls the
+  worker's event loop and every connection on it, which is why the client
+  uses cosockets only.
 
 **Why the log phase.** By then the status is known (429 from `limit_req`,
 401 from auth) and the client has already been answered, so the ban adds

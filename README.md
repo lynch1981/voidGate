@@ -140,13 +140,13 @@ location / {
 }
 ```
 
-`ban(ip, ttl, opt)` works from any phase, log included: it queues the
-request in an `ngx.timer.at` timer and returns `true`. The daemon's answer
-goes to the nginx error log. With `opt.dict`, an address is sent at most
-once per `opt.window` seconds (default 10), so the burst before XDP takes
-over does not queue one timer per request. `opt.client` takes a client from
-`new()`. A Kong or APISIX plugin calls the same function from its `log`
-handler.
+`ban(ip, ttl, opt)` works from every phase but `init_by_lua*`, log included:
+it queues the request in an `ngx.timer.at` timer and returns `true`. The
+daemon's answer goes to the nginx error log. With `opt.dict`, an address is
+sent at most once per `opt.window` seconds (default 10), so the burst before
+XDP takes over does not queue one timer per request. `opt.client` takes a
+client from `new()`. A Kong or APISIX plugin calls the same function from
+its `log` handler.
 
 The ban is `drop <ip> ttl=<ttl>` on the socket (`reason=4`). It lifts itself
 after `ttl` seconds (1 to one year). Banning the same prefix again only
@@ -179,7 +179,8 @@ ngx.say(stats.rx_pkts) -- Decimal string: preserves all 64 bits.
 ```
 
 Cosockets yield, so call methods from `rewrite`, `access`, `content` or a
-timer. Use `ban()` from any other phase.
+timer. Use `ban()` from the other phases; neither works in `init_by_lua*`.
+The full table is in `doc/l7-bridge.md` §9.
 
 | Method | Successful return |
 | --- | --- |

@@ -3,8 +3,9 @@
 -- voidGate client for OpenResty (and OpenResty-based gateways such as
 -- Kong and APISIX). Talks to the daemon's Unix socket with a non-blocking
 -- ngx.socket.tcp cosocket. Cosockets yield, so the methods run in rewrite,
--- access, content or timer context; from any other phase (log,
--- header_filter, body_filter, init) use M.ban(), which runs in a timer.
+-- access, content or timer context; from log, header_filter, body_filter,
+-- set, balancer or init_worker use M.ban(), which runs in a timer. Neither
+-- works in init_by_lua (the master process).
 
 local ngx = ngx
 
@@ -178,7 +179,8 @@ local function ban_timer(premature, c, cidr, ttl)
     end
 end
 
--- Ban one client address at XDP for ttl seconds, from any phase.
+-- Ban one client address at XDP for ttl seconds, from any phase but
+-- init_by_lua.
 -- Returns true once the ban is queued (or was queued within the window);
 -- the daemon's answer is logged, not returned. Options:
 --   dict    lua_shared_dict name. With it, an address is sent at most once
