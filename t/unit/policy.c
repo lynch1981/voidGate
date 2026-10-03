@@ -33,6 +33,7 @@ vg_drop_del(struct vg_maps *m, const struct vg_cidr *p)
     (void) m;
     deleted = *p;
     deleted_count++;
+
     return 0;
 }
 
@@ -45,6 +46,7 @@ vg_drop_add(struct vg_maps *m, const struct vg_cidr *p, uint32_t reason,
     (void) p;
     (void) reason;
     (void) now;
+
     return 0;
 }
 
@@ -56,6 +58,7 @@ vg_cfg_commit(struct vg_maps *m, uint32_t armed,
     (void) m;
     (void) armed;
     (void) cfg;
+
     return 0;
 }
 
@@ -64,6 +67,7 @@ int
 vg_drop_flush(struct vg_maps *m)
 {
     (void) m;
+
     return 0;
 }
 
@@ -73,6 +77,7 @@ vg_populate_allow(struct vg_maps *m, const struct vg_config *cfg)
 {
     (void) m;
     (void) cfg;
+
     return 0;
 }
 
@@ -82,6 +87,7 @@ vg_populate_local(struct vg_maps *m, const struct vg_config *cfg)
 {
     (void) m;
     (void) cfg;
+
     return 0;
 }
 
@@ -91,6 +97,7 @@ vg_metrics_read(struct vg_maps *m, struct vg_metrics *out)
 {
     (void) m;
     memset(out, 0, sizeof(*out));
+
     return 0;
 }
 
@@ -136,6 +143,7 @@ static int
 tick(struct vg_ctrl *c)
 {
     force_dt(c);
+
     return vg_ctrl_tick(c);
 }
 
@@ -271,5 +279,6 @@ main(void)
 
     vg_ctrl_free(&c);
     puts("control-plane regression tests passed");
+
     return 0;
 }

@@ -64,6 +64,7 @@ vg_parse_cidr(const char *s, struct vg_cidr *out)
 
     out->prefixlen = (uint8_t) (plen < 0 ? max : plen);
     vg_cidr_mask(out);
+
     return 0;
 }
 
@@ -167,6 +168,7 @@ vg_cidr_v4_slash24(const struct vg_cidr *host, struct vg_cidr *net)
     *net = *host;
     net->prefixlen = 24;
     vg_cidr_mask(net);
+
     return 0;
 }
 
@@ -181,6 +183,7 @@ vg_cidr_v6_slash64(const struct vg_cidr *host, struct vg_cidr *net)
     *net = *host;
     net->prefixlen = 64;
     vg_cidr_mask(net);
+
     return 0;
 }
 

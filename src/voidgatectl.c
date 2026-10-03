@@ -66,5 +66,6 @@ main(int argc, char **argv)
         fputs(buf, stdout);
     }
     close(fd);
+
     return 0;
 }
