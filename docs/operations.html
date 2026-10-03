@@ -279,7 +279,7 @@ location / {
     }
 }</code></pre>
                 </div>
-                <p><code>ban(ip, ttl, opt)</code> works from every phase but <code>init_by_lua*</code>, log included, and sends one ban per address per window. The other methods (<code>status()</code>, <code>stats()</code>, <code>drops()</code>, <code>drop(cidr [, ttl])</code>, <code>undrop()</code>, <code>arm()</code>, <code>disarm()</code>, <code>reload()</code>) run in rewrite, access, content or timer context and return <code>nil, err</code> on failure. <code>stats()</code> returns 64-bit counters as decimal strings.</p>
+                <p><code>ban(ip, ttl, opt)</code> works from every phase but <code>init_by_lua*</code>, log included, and sends one ban per address per window. <code>ban_now(ip, ttl)</code> sends at once and returns the daemon's answer, in rewrite, access, content or timer context. Every drop from Lua needs a ttl: a permanent drop is <code>voidgatectl drop</code>'s job. The other methods (<code>status()</code>, <code>stats()</code>, <code>drops()</code>, <code>drop(cidr, ttl)</code>, <code>undrop()</code>, <code>arm()</code>, <code>disarm()</code>, <code>reload()</code>) run in rewrite, access, content or timer context and return <code>nil, err</code> on failure. <code>stats()</code> returns 64-bit counters as decimal strings.</p>
                 <aside class="note warn">Ban only real peers. Behind a CDN or load balancer, put the proxy ranges in <code>allow_networks</code>, or a forged client-IP header can ban your own front door. Any drop keeps the gate armed until it lifts.</aside>
 
                 <h2>ACTIVE policy, short</h2>

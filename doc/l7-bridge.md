@@ -267,30 +267,52 @@ use `voidgatectl drops`.
 
 ## 9. Client: `resty.voidgate`
 
-`lua/resty/voidgate.lua` is the only Lua client: methods, response parsing
-and `ban()` in one module that needs nothing beyond lua-nginx-module. It
-follows the OpenResty `resty.*` naming convention.
+`lua/resty/voidgate.lua` is the only Lua client: methods, response parsing,
+`ban()` and `ban_now()` in one module that needs nothing beyond
+lua-nginx-module. It follows the OpenResty `resty.*` naming convention.
 
 ```lua
 local vg = require("resty.voidgate")
-vg.status() / vg.stats() / vg.drops() / vg.drop(cidr [, ttl]) / ...
 vg.ban(ip, ttl, { dict = "voidgate_ban", window = 10, client = c })
+vg.ban_now(ip, ttl, { client = c })            -- true, or nil, err
+vg.drop(cidr, ttl) / vg.undrop(cidr)           -- prefixes, ttl required
+vg.status() / vg.stats() / vg.drops() / vg.arm() / vg.disarm() / vg.reload()
 vg.new({ path = "/run/voidgate.sock", timeout = 1 })   -- seconds
 ```
+
+**Which call.** Request code bans one client address; `ban()` and
+`ban_now()` take that address and differ only in when they talk to the
+daemon. `drop()` / `undrop()` mirror the socket protocol for prefixes.
+
+| | `ban(ip, ttl, opt)` | `ban_now(ip, ttl, opt)` | `drop(cidr, ttl)` |
+|---|---|---|---|
+| target | one address | one address | any CIDR |
+| sends | later, from a timer | now | now |
+| phases | all but `init_by_lua*` | cosocket phases | cosocket phases |
+| returns | `true` once queued; answer logged | `true`, or `nil, err` | `true`, or `nil, err` |
+| deduplication | once per window with `opt.dict` | none | none |
+
+**No permanent drop from Lua.** Every one of these needs a ttl (1 s to one
+year); `drop(cidr)` without one is `nil, "bad ttl"` and nothing is sent.
+Gateway code that forgets a ttl must not leave a drop nothing will lift.
+A permanent drop is an operator's decision: `voidgatectl drop <cidr>`.
 
 **Transport.** `ngx.socket.tcp()` connects to `unix:<path>`, sends one line
 and reads with `receive("*a")` until the daemon closes. No keepalive pool:
 the protocol is one command per connection.
 
 **Phases.** Plain Lua runs in every phase; what ngx_lua restricts per phase
-is I/O. The methods (`drop`, `status`, ...) talk to the daemon over a
-cosocket, which yields, so they run only where cosockets are allowed.
+is I/O. `ban_now()` and the methods (`drop`, `status`, ...) talk to the
+daemon over a cosocket, which yields, so they work only where cosockets are
+allowed. Elsewhere ngx_lua *raises* `API disabled in the context of ...`,
+which would abort the caller's handler; the client catches that and
+returns `nil, "no cosocket in this phase, use ban()"` instead.
 `ban()` does no I/O itself: it validates its input, does a shared-dict
 `add` and queues `ngx.timer.at(0, ...)`, then returns `true` at once. The
 daemon request runs later in timer context, where cosockets are allowed,
 and its answer goes to the nginx error log, never to the request.
 
-| Context | Methods (cosocket) | `ban()` (`ngx.timer.at`) |
+| Context | `ban_now()` and methods (cosocket) | `ban()` (`ngx.timer.at`) |
 |---|---|---|
 | `rewrite_by_lua*`, `access_by_lua*`, `content_by_lua*` | yes | yes |
 | `ngx.timer.*` callbacks | yes | yes |
@@ -300,13 +322,13 @@ and its answer goes to the nginx error log, never to the request.
 | `init_worker_by_lua*` | no | yes |
 | `init_by_lua*` (master process) | no | no |
 
-- Call a method when the caller needs the daemon's answer, for example
-  in `access_by_lua*` or a timer; call `ban()` from anywhere else. Any
-  Lua logic can call either: a `log_by_lua*` counter, a Kong or APISIX
+- Call `ban_now()` when the caller needs the daemon's answer, for example
+  in `access_by_lua*` or a timer; call `ban()` from anywhere else. Any Lua
+  logic can call either: a `log_by_lua*` counter, a Kong or APISIX
   plugin's `log` handler, or another library's callback.
 - A periodic aggregator inside OpenResty is a timer: start it with
-  `ngx.timer.every` from `init_worker_by_lua*`, and call the methods
-  directly from its callback.
+  `ngx.timer.every` from `init_worker_by_lua*`, and call `ban_now()` or
+  the methods directly from its callback.
 - Blocking I/O (LuaSocket, `io.*`) is not forbidden, but it stalls the
   worker's event loop and every connection on it, which is why the client
   uses cosockets only.
@@ -401,6 +423,9 @@ For anyone upgrading:
   per-tick summaries; use `-v` for the old detail.
 - **`drop <cidr> <junk>`** answers `error: bad ttl`; a misplaced or empty
   CIDR answers `error: bad cidr`.
+- **No permanent drop from Lua.** The removed LuaSocket client's
+  `drop(cidr)` made one; `resty.voidgate` requires a ttl on every drop.
+  `voidgatectl drop <cidr>` still makes a permanent drop.
 
 ## 14. Alternatives considered
 
@@ -416,6 +441,13 @@ For anyone upgrading:
   BPF change. Revisit if web bans keeping the gate armed costs measurably.
 - **A generic Lua client plus an OpenResty wrapper.** Rejected: two modules
   and a pluggable transport add surface for hosts we do not target.
+- **Other client APIs.** Module-level `drop()` next to `ban()` read as two
+  names for one thing, and `drop(ip)` without a ttl made a permanent drop.
+  Hiding the protocol methods behind `vg.new()` was considered; a single
+  `ban()` that checks `ngx.get_phase()` was rejected because it would
+  return different things in different phases. Chosen: `ban()` and
+  `ban_now()` name the difference (queued or now), and a ttl is required
+  everywhere.
 - **fail2ban.** Deferred. Its most common jail (sshd) would do nothing:
   invariant 4 passes TCP to local `allow_ports` before the drop lookup. It
   bans at low rates that `nftables` already handles cheaply, and correct
@@ -445,7 +477,7 @@ For anyone upgrading:
 | `t/drop-ttl.t` | protocol parsing: v4 and v6, refusal, ttl bounds and digits-only, CIDR-first errors |
 | `t/drop-ttl-xdp.t` | a timed drop really drops at XDP; SSH still passes |
 | `t/integration/daemon.sh` | `ctl_socket_group` chown, kept on reload, unknown group only warns; `voidgatectl` exits 1 on error |
-| `t/integration/resty.sh` + `resty.lua` | real nginx with workers as `nobody:nogroup`: every method against a real daemon, ttl validation, reload; `ban()` from the log phase; 50 requests send exactly one ban |
+| `t/integration/resty.sh` + `resty.lua` | real nginx with workers as `nobody:nogroup`: every method against a real daemon, ttl required and validated, reload; `ban_now()` answers and local rejects; `ban()` from the log phase, 50 requests send exactly one ban; `ban_now()` from the log phase returns an error instead of aborting the handler |
 
 `resty.sh` needs OpenResty, or nginx with `lua-nginx-module`
 (Ubuntu: `nginx-core libnginx-mod-http-lua`), and skips otherwise.

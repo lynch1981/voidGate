@@ -148,6 +148,13 @@ XDP takes over does not queue one timer per request. `opt.client` takes a
 client from `new()`. A Kong or APISIX plugin calls the same function from
 its `log` handler.
 
+When the caller needs the daemon's answer, for example in `access_by_lua*`
+or a timer, use `ban_now(ip, ttl)`: the same rules, sent at once, returning
+`true` or `nil, err` (a refused address, a daemon that is down). It needs a
+cosocket, so in the log phase it returns `nil, "no cosocket in this phase,
+use ban()"`. Every drop from Lua has a ttl; a permanent drop is an
+operator's decision (`voidgatectl drop <cidr>`).
+
 The ban is `drop <ip> ttl=<ttl>` on the socket (`reason=4`). It lifts itself
 after `ttl` seconds (1 to one year). Banning the same prefix again only
 extends it, a manual `drop` of it makes it permanent, and timed drops never
@@ -169,7 +176,9 @@ local vg = require("resty.voidgate")
 local status = assert(vg.status())
 ngx.say(status.state, " ", status.rx_pps)
 
-assert(vg.drop("203.0.113.0/24"))
+local ok, err = vg.ban_now("203.0.113.7", 600)  -- the daemon's answer
+
+assert(vg.drop("203.0.113.0/24", 600))           -- a prefix; ttl required
 assert(vg.undrop("203.0.113.0/24"))
 
 -- Optional settings; each call opens and closes its own connection.
@@ -178,8 +187,9 @@ local stats = assert(client:stats())
 ngx.say(stats.rx_pkts) -- Decimal string: preserves all 64 bits.
 ```
 
-Cosockets yield, so call methods from `rewrite`, `access`, `content` or a
-timer. Use `ban()` from the other phases; neither works in `init_by_lua*`.
+Cosockets yield, so call the methods and `ban_now()` from `rewrite`,
+`access`, `content` or a timer; elsewhere they return `nil, err`. Use
+`ban()` from the other phases; neither works in `init_by_lua*`.
 The full table is in `doc/l7-bridge.md` §9.
 
 | Method | Successful return |
@@ -188,8 +198,9 @@ The full table is in `doc/l7-bridge.md` §9.
 | `stats()` | Table: counters as decimal strings; numeric rates and prefix count; string `state` |
 | `drops()` | Array of `{ cidr, reason, age }` entries; empty array when there are no drops |
 | `arm()`, `disarm()`, `reload()` | `true` |
-| `drop(cidr [, ttl])`, `undrop(cidr)` | `true`; with `ttl` (seconds, 1–31536000) the daemon lifts the drop itself |
+| `drop(cidr, ttl)`, `undrop(cidr)` | `true`; `ttl` (seconds, 1–31536000) is required, and the daemon lifts the drop itself |
 | `ban(ip, ttl [, opt])` | `true` once queued; see above |
+| `ban_now(ip, ttl [, opt])` | `true`, or `nil, err` with the daemon's answer |
 
 Operations return `nil, error` on connection, timeout, or daemon errors.
 CIDR validity is checked by the daemon; the client only rejects a CIDR

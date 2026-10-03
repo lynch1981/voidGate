@@ -25,27 +25,43 @@ ok(stats and type(stats.rx_pkts) == "string" and stats.rx_pkts:match("^%d+$")
     and stats.dropped == "0" and stats.prefixes == 0, "stats")
 
 ok(#assert(conn:drops()) == 0, "empty drops")
-ok(conn:drop("203.0.113.0/24"), "drop v4")
+ok(conn:drop("203.0.113.0/24", 60), "drop v4")
 local drops = conn:drops()
 ok(drops and #drops == 1 and drops[1].cidr == "203.0.113.0/24"
-    and drops[1].reason == 1 and drops[1].age >= 0, "list v4 drop")
+    and drops[1].reason == 4 and drops[1].age >= 0, "list v4 drop")
 ok(conn:undrop("203.0.113.0/24") and #assert(conn:drops()) == 0, "undrop v4")
-ok(conn:drop("2001:db8::/64")
+ok(conn:drop("2001:db8::/64", 60)
     and conn:drops()[1].cidr == "2001:db8::/64", "drop v6")
 ok(conn:undrop("2001:db8::/64"), "undrop v6")
-pass, err = conn:drop("bad-cidr")
+pass, err = conn:drop("bad-cidr", 60)
 ok(pass == nil and err == "error: bad cidr", "reject bad cidr")
 ok(conn:drop() == nil and conn:drop(123) == nil and conn:drop("a b") == nil
     and conn:drop("203.0.113.0/24\narm") == nil, "drop rejects locally")
-ok(conn:drop("203.0.113.0/24") and conn:drop("2001:db8::/64")
+ok(conn:drop("203.0.113.0/24", 60) and conn:drop("2001:db8::/64", 60)
     and conn:disarm() and #assert(conn:drops()) == 0
     and conn:status().armed == false, "disarm clears drops")
 
 ok(conn:drop("203.0.113.9/32", 60) and conn:drops()[1].reason == 4
     and conn:status().armed == true, "ttl drop")
-ok(conn:drop("203.0.113.9/32") and conn:drops()[1].reason == 1,
-    "manual drop upgrades a ttl drop")
 ok(conn:disarm(), "disarm after ttl drop")
+
+-- No permanent drop from Lua: a missing ttl is refused before sending.
+pass, err = conn:drop("203.0.113.9/32")
+ok(pass == nil and err == "bad ttl" and #assert(conn:drops()) == 0
+    and conn:status().armed == false, "drop without ttl refused locally")
+
+-- ban_now: a bare ip, a required ttl, the daemon's answer returned.
+ok(vg.ban_now("203.0.113.10", 60) and conn:drops()[1].cidr
+    == "203.0.113.10/32" and conn:drops()[1].reason == 4, "ban_now v4")
+ok(vg.ban_now("2001:db8::10", 60, { client = conn }), "ban_now v6")
+pass, err = vg.ban_now("127.0.0.1", 60)
+ok(pass == nil and err == "error: refused or map update failed",
+    "ban_now returns the refusal")
+ok(vg.ban_now("203.0.113.0/24", 60) == nil
+    and select(2, vg.ban_now("203.0.113.0/24", 60)) == "bad ip"
+    and select(2, vg.ban_now("203.0.113.11")) == "bad ttl"
+    and #assert(conn:drops()) == 2, "ban_now rejects locally")
+ok(conn:disarm(), "disarm after ban_now")
 for _, ttl in ipairs({ 0, -1, 1.5, "x", 31536001 }) do
     pass, err = conn:drop("203.0.113.9/32", ttl)
     ok(pass == nil and err == "bad ttl", "reject ttl " .. tostring(ttl))
@@ -71,8 +87,8 @@ write_config(config .. "wake_pps = invalid\n")
 pass, err = conn:reload()
 ok(pass == nil and err == "error: reload failed", "reload invalid config")
 write_config(config)
-ok(conn:reload() and conn:drop("203.0.113.1/32")
-    and conn:drop("2001:db8::1/128") and conn:disarm(), "reload restored")
+ok(conn:reload() and conn:drop("203.0.113.1/32", 60)
+    and conn:drop("2001:db8::1/128", 60) and conn:disarm(), "reload restored")
 
 local missing = vg.new({ path = "/run/voidgate.sock.missing" })
 pass, err = missing:status()

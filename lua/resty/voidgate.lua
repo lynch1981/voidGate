@@ -2,10 +2,15 @@
 --
 -- voidGate client for OpenResty (and OpenResty-based gateways such as
 -- Kong and APISIX). Talks to the daemon's Unix socket with a non-blocking
--- ngx.socket.tcp cosocket. Cosockets yield, so the methods run in rewrite,
--- access, content or timer context; from log, header_filter, body_filter,
--- set, balancer or init_worker use M.ban(), which runs in a timer. Neither
--- works in init_by_lua (the master process).
+-- ngx.socket.tcp cosocket. Cosockets yield, so the methods and M.ban_now()
+-- run in rewrite, access, content or timer context; from log,
+-- header_filter, body_filter, set, balancer or init_worker use M.ban(),
+-- which runs in a timer. Neither works in init_by_lua (the master
+-- process). A method called where cosockets are disabled returns
+-- nil, err instead of raising.
+--
+-- Lua cannot install a permanent drop: every drop needs a ttl. A permanent
+-- drop is an operator's decision (voidgatectl drop <cidr>).
 
 local ngx = ngx
 
@@ -23,7 +28,12 @@ local counters = {
 
 -- One command per connection: the daemon replies and closes.
 local function request(self, cmd)
-    local sock = ngx.socket.tcp()
+    -- ngx_lua raises, rather than returns, where cosockets are disabled.
+    local created, sock = pcall(ngx.socket.tcp)
+    if not created then
+        return nil, "no cosocket in this phase, use ban(): " .. tostring(sock)
+    end
+
     sock:settimeout(self.timeout * 1000)
 
     local ok, err = sock:connect("unix:" .. self.path)
@@ -128,13 +138,11 @@ function client:reload()
     return commit(self, "reload")
 end
 
--- ttl (seconds, optional): the daemon lifts the drop itself after ttl.
+-- Drop a prefix for ttl seconds (required, 1 .. one year); the daemon
+-- lifts it itself. No ttl is "bad ttl": a permanent drop is not for Lua.
 function client:drop(cidr, ttl)
     if type(cidr) ~= "string" or cidr:find("%s") then
         return nil, "bad cidr"
-    end
-    if ttl == nil then
-        return commit(self, "drop " .. cidr)
     end
     ttl = check_ttl(ttl)
     if not ttl then
@@ -168,6 +176,14 @@ for _, name in ipairs({
     end
 end
 
+-- "<ip>/32" or "<ip>/128" for a bare address, else nil.
+local function host_cidr(ip)
+    if type(ip) ~= "string" or ip == "" or ip:find("[%s/]") then
+        return nil
+    end
+    return ip .. (ip:find(":", 1, true) and "/128" or "/32")
+end
+
 local function ban_timer(premature, c, cidr, ttl)
     if premature then
         return
@@ -193,7 +209,8 @@ end
 function M.ban(ip, ttl, opt)
     opt = opt or {}
 
-    if type(ip) ~= "string" or ip == "" or ip:find("[%s/]") then
+    local cidr = host_cidr(ip)
+    if not cidr then
         return nil, "bad ip"
     end
 
@@ -201,8 +218,6 @@ function M.ban(ip, ttl, opt)
     if not ttl then
         return nil, "bad ttl"
     end
-
-    local cidr = ip .. (ip:find(":", 1, true) and "/128" or "/32")
 
     if opt.dict then
         local dict = ngx.shared[opt.dict]
@@ -220,6 +235,19 @@ function M.ban(ip, ttl, opt)
     end
 
     return ngx.timer.at(0, ban_timer, opt.client or default, cidr, ttl)
+end
+
+-- Ban one client address for ttl seconds now and return the daemon's
+-- answer: true, or nil, err (refused, bad input, daemon down, or a phase
+-- without cosockets). Same ip and ttl rules as M.ban(), no deduplication.
+-- Only where cosockets work (rewrite, access, content, timers); elsewhere
+-- use M.ban(). opt.client: a client from M.new().
+function M.ban_now(ip, ttl, opt)
+    local cidr = host_cidr(ip)
+    if not cidr then
+        return nil, "bad ip"
+    end
+    return ((opt and opt.client) or default):drop(cidr, ttl)
 end
 
 return M

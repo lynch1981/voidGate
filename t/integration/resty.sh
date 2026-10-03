@@ -83,6 +83,17 @@ http {
             }
         }
 
+        # ban_now() in the log phase: no cosocket there, so an error
+        # return (not a raised error that aborts the handler).
+        location = /ban_now_log {
+            content_by_lua_block { ngx.say("ok") }
+            log_by_lua_block {
+                local ok, err = require("resty.voidgate").ban_now(
+                    ngx.var.arg_ip, 60)
+                ngx.log(ngx.ERR, "ban_now from log: ", tostring(ok), " ", err)
+            }
+        }
+
         # ban() from the log phase, where cosockets are not allowed.
         location = /ban {
             content_by_lua_block { ngx.say("queued") }
@@ -133,8 +144,13 @@ for i in $(seq 30); do
 done
 grep -q '\] dropped [0-9]* prefix.*timed [1-9]' "$work/daemon.log"
 get '/ban?ip=1.2.3.4/24' > /dev/null
+get '/ban_now_log?ip=198.18.0.30' > /dev/null
 sleep 0.2
 grep -q 'ban: bad ip' "$prefix/error.log"
+grep -q 'ban_now from log: nil no cosocket in this phase, use ban()' \
+    "$prefix/error.log"
+! grep -q 'failed to run log_by_lua' "$prefix/error.log"
+! "$root/voidgatectl" drops | grep -q '198.18.0.30/32'
 ! grep -q '\[alert\]\|\[crit\]' "$prefix/error.log"
 
 echo "resty client tests passed"
