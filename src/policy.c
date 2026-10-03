@@ -144,7 +144,9 @@ snap_get(struct vg_ctrl *c, int family, const uint8_t *addr, int *created)
     e->gen = c->snap_gen;
     e->next = c->snaps[h];
     c->snaps[h] = e;
+
     *created = 1;
+
     return e;
 }
 
@@ -278,6 +280,7 @@ vg_ctrl_drop(struct vg_ctrl *c, const struct vg_cidr *p, uint32_t reason)
     }
 
     vg_log("drop %s reason %u", buf, reason);
+
     return 0;
 }
 
@@ -301,6 +304,7 @@ vg_ctrl_undrop(struct vg_ctrl *c, const struct vg_cidr *p)
     }
 
     vg_log("undrop %s", buf);
+
     return 0;
 }
 
@@ -349,6 +353,7 @@ vg_ctrl_arm(struct vg_ctrl *c, const char *why)
 
     c->state = VG_ACTIVE;
     vg_log("armed (%s)", why != NULL ? why : "");
+
     return 0;
 }
 
@@ -367,6 +372,7 @@ vg_ctrl_disarm(struct vg_ctrl *c, const char *why)
     c->state = VG_IDLE;
     c->quiet_since = 0;
     vg_log("disarmed (%s)", why != NULL ? why : "");
+
     return 0;
 }
 

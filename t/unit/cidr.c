@@ -57,6 +57,7 @@ load_config(const char *line, struct vg_config *cfg)
     fclose(fp);
     rc = vg_config_load(path, cfg);
     unlink(path);
+
     return rc;
 }
 
@@ -174,5 +175,6 @@ main(void)
     }
 
     puts("cidr unit tests passed");
+
     return 0;
 }

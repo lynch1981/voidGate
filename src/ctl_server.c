@@ -247,6 +247,7 @@ vg_ctrl_reload(struct vg_ctrl *c)
     }
 
     vg_log("reloaded %s", c->cfg_path);
+
     return 0;
 }
 
@@ -283,6 +284,7 @@ vg_ctl_server_alive(const char *path)
     /* A leftover socket file from a crash refuses; a daemon accepts. */
     alive = connect(fd, (struct sockaddr *) &addr, sizeof(addr)) == 0;
     close(fd);
+
     return alive;
 }
 

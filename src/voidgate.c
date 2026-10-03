@@ -513,5 +513,6 @@ main(int argc, char **argv)
     close(pid_fd);
 
     vg_log("exit");
+
     return result;
 }
