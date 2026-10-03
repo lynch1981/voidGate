@@ -351,6 +351,14 @@ and `/32` or `/128` is appended depending on whether it contains `:`. The
 ttl is checked locally (an integer, 1 s to one year); the daemon does the
 final CIDR validation.
 
+**Example.** `contrib/openresty/nginx.conf` is a complete config that uses
+each pattern in its phase: a health timer started in `init_worker_by_lua*`
+(methods in a timer), a honeypot path banned with `ban_now()` in
+`access_by_lua*`, failed logins counted in a shared dict and banned with
+`ban()` in `log_by_lua*`, `limit_req` 429s banned the same way, and a local
+status page using the methods in `content_by_lua*`.
+`t/integration/example.sh` runs it as shipped.
+
 **Install.** `make install-lua` copies the file to
 `/usr/local/openresty/site/lualib/resty/`. For Kong or APISIX, set
 `LUA_DIR` to a directory on the gateway's Lua path (Kong:
@@ -478,6 +486,8 @@ For anyone upgrading:
 | `t/drop-ttl-xdp.t` | a timed drop really drops at XDP; SSH still passes |
 | `t/integration/daemon.sh` | `ctl_socket_group` chown, kept on reload, unknown group only warns; `voidgatectl` exits 1 on error |
 | `t/integration/resty.sh` + `resty.lua` | real nginx with workers as `nobody:nogroup`: every method against a real daemon, ttl required and validated, reload; `ban_now()` answers and local rejects; `ban()` from the log phase, 50 requests send exactly one ban; `ban_now()` from the log phase returns an error instead of aborting the handler |
+| `t/integration/example.sh` | `contrib/openresty/nginx.conf` as shipped: honeypot banned at once, a refused protected address logged, 9 failed logins do nothing and the 10th bans, a 429 burst bans, the status page lists the drops |
 
-`resty.sh` needs OpenResty, or nginx with `lua-nginx-module`
-(Ubuntu: `nginx-core libnginx-mod-http-lua`), and skips otherwise.
+`resty.sh` and `example.sh` need OpenResty, or nginx with `lua-nginx-module`
+(Ubuntu: `nginx-core libnginx-mod-http-lua`), and skip otherwise;
+`example.sh` also needs python3 for its stub backend.

@@ -38,6 +38,7 @@ t/unit/cidr.c            CIDR parser + config CIDR lists unit test
 t/integration/*.sh       daemon / OpenResty / veth flood (needs root)
 lua/resty/voidgate.lua   OpenResty client (cosocket) + ban(); the only
                          Lua client (Kong / APISIX run on OpenResty)
+contrib/openresty/       example nginx.conf, run as is by example.sh
 ```
 
 Generated, do not edit or commit: `src/bpf/voidgate.skel.h`, `*.o`,
@@ -115,6 +116,7 @@ make test                         # t/unit/* + sudo t/bin/run
 sudo t/integration/netns.sh
 sudo t/integration/daemon.sh
 sudo t/integration/resty.sh       # needs nginx + lua module; else skips
+sudo t/integration/example.sh     # contrib/openresty example; same needs
 ```
 
 Needs clang, llvm, libbpf, bpftool, libelf, libtest-base-perl, root
