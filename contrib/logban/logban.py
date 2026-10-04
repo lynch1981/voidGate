@@ -342,6 +342,7 @@ class Judge:
         self.lines = 0
         self.skipped = 0
         self.unjudged = 0
+        self.history = None         # list: keep every ban (--review)
 
     def feed(self, line):
         r = parse_line(line)
@@ -466,6 +467,9 @@ class Judge:
 
         self.offenses[ip] = (count + 1, now)
         self.banned[ip] = now + ttl
+
+        if self.history is not None:
+            self.history.append((now, ip, ttl, total, costly, cost, rule))
         self.win.remove(ip)
 
         if len(self.banned) > 65536:
@@ -608,6 +612,138 @@ def ctl_drop(path):
     return drop
 
 
+def summarize(history):
+    """One row per address, most costly first. The ttl is the last
+    (longest) one the replay reached."""
+
+    rows = {}
+
+    for now, ip, ttl, total, costly, cost, rule in history:
+        r = rows.get(ip)
+
+        if r is None:
+            r = rows[ip] = {"ip": ip, "bans": 0, "total": 0, "costly": 0,
+                            "cost": 0.0, "rules": set(), "first": now}
+
+        r["bans"] += 1
+        r["ttl"] = ttl
+        r["total"] += total
+        r["costly"] += costly
+        r["cost"] += cost
+        r["rules"].add(rule)
+        r["last"] = now
+
+    return sorted(rows.values(), key=lambda r: (-r["costly"], r["ip"]))
+
+
+def print_rows(rows, out):
+    width = max(len(r["ip"]) for r in rows)
+    out.write("%3s  %-*s %5s %7s %7s %6s %9s  %-13s %s\n"
+              % ("#", width, "address", "bans", "ttl", "costly", "ratio",
+                 "backend", "rule", "seen (UTC)"))
+
+    for i, r in enumerate(rows, 1):
+        seen = time.strftime("%m-%d %H:%M", time.gmtime(r["first"]))
+
+        if r["last"] - r["first"] >= 60:
+            seen += time.strftime(" .. %H:%M", time.gmtime(r["last"]))
+
+        out.write("%3d  %-*s %5d %7d %7d %6.2f %8.1fs  %-13s %s\n"
+                  % (i, width, r["ip"], r["bans"], r["ttl"], r["costly"],
+                     r["costly"] / r["total"], r["cost"],
+                     ",".join(sorted(r["rules"])), seen))
+
+
+def parse_selection(text, n):
+    """Row numbers (1-based) picked by "a", "n", or "1-3,7 9"; None when
+    the answer does not parse."""
+
+    text = text.strip().lower()
+
+    if text in ("a", "all"):
+        return list(range(1, n + 1))
+
+    if text in ("", "n", "none", "q", "quit"):
+        return []
+
+    picked = set()
+
+    for word in re.split(r"[,\s]+", text):
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", word)
+
+        if m is None:
+            return None
+
+        lo = int(m.group(1))
+        hi = int(m.group(2) or lo)
+
+        if not 1 <= lo <= hi <= n:
+            return None
+
+        picked.update(range(lo, hi + 1))
+
+    return sorted(picked)
+
+
+def ask_tty(prompt):
+    """Ask on the terminal, not stdin: the log may come from stdin."""
+
+    # Two handles: a text file opened "r+" must be seekable, a tty is not.
+    with open("/dev/tty", "w") as w, open("/dev/tty") as r:
+        w.write(prompt)
+        w.flush()
+        answer = r.readline()
+
+    if not answer:
+        raise EOFError
+
+    return answer
+
+
+def review(judge, act, ask, out):
+    """Show what the replay would ban, ban only what the user picks.
+    Returns the exit code."""
+
+    rows = summarize(judge.history)
+
+    if not rows:
+        out.write("nothing to ban\n")
+        return 0
+
+    print_rows(rows, out)
+    out.flush()
+
+    while True:
+        try:
+            answer = ask("ban which? [a]ll, [n]one, or numbers like"
+                         " 1-3,7: ")
+
+        except EOFError:
+            answer = "n"
+
+        picked = parse_selection(answer, len(rows))
+
+        if picked is not None:
+            break
+
+        out.write("pick 1 to %d, a or n\n" % len(rows))
+
+    failed = 0
+
+    for i in picked:
+        r = rows[i - 1]
+        err = act(r["ip"], r["ttl"])
+        failed += err is not None
+        out.write("%s %s ttl=%d%s\n"
+                  % ("ban" if act is not dry_run else "would ban", r["ip"],
+                     r["ttl"], " error=" + err if err else ""))
+
+    if not picked:
+        out.write("nothing banned\n")
+
+    return 1 if failed else 0
+
+
 def read_files(paths):
     for path in paths:
         if path == "-":
@@ -679,6 +815,8 @@ def main(argv=None):
                     help="print bans, send nothing")
     ap.add_argument("-f", "--follow", action="store_true",
                     help="follow one log like tail -F")
+    ap.add_argument("-r", "--review", action="store_true",
+                    help="replay, list the bans, ban only those you pick")
     ap.add_argument("--from-start", action="store_true",
                     help="with -f, read the existing file first")
     ap.add_argument("--top-paths", type=int, metavar="N", default=0,
@@ -700,7 +838,19 @@ def main(argv=None):
         return 1
 
     act = dry_run if args.dry_run else ctl_drop(cfg.socket)
-    judge = Judge(cfg, act, verbose=args.verbose)
+
+    if args.review:
+        if args.follow:
+            sys.stderr.write("logban: --review replays logs, not -f\n")
+            return 1
+
+        # Judge as a dry run; bans happen after the user picks them.
+        judge = Judge(cfg, dry_run, out=open(os.devnull, "w"),
+                      verbose=args.verbose)
+        judge.history = []
+
+    else:
+        judge = Judge(cfg, act, verbose=args.verbose)
 
     if args.follow:
         if len(args.logs) != 1 or args.logs[0] == "-":
@@ -732,6 +882,18 @@ def main(argv=None):
 
     if args.top_paths:
         judge.report(args.top_paths)
+
+    if args.review:
+        try:
+            return review(judge, act, ask_tty, sys.stdout)
+
+        except OSError as e:
+            sys.stderr.write("logban: --review needs a terminal: %s\n" % e)
+            return 1
+
+        except KeyboardInterrupt:
+            sys.stdout.write("\nnothing banned\n")
+            return 1
 
     return 0
 

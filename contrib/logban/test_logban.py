@@ -557,5 +557,122 @@ class CdnAllowTest(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.dirname(path)), ["cdn.txt"])
 
 
+class ReviewTest(unittest.TestCase):
+
+    def replay(self):
+        act = Recorder()
+        judge = logban.Judge(config(ttl=60), logban.dry_run,
+                             out=io.StringIO())
+        judge.history = []
+        lines = merge(bot("203.0.113.7", n=300),
+                      bot("203.0.113.8", n=150),
+                      bot("2001:db8::9", n=200),
+                      bot("203.0.113.7", n=200, start=T0 + 600),
+                      browser("198.51.100.9"))
+
+        for s in lines:
+            judge.feed(s)
+
+        judge.finish()
+        return judge, act
+
+    def review(self, answers, act=None):
+        judge, rec = self.replay()
+        act = act or rec
+        answers = iter(answers)
+        prompts = []
+
+        def ask(prompt):
+            prompts.append(prompt)
+            a = next(answers, None)
+
+            if a is None:
+                raise EOFError
+
+            return a
+
+        out = io.StringIO()
+        code = logban.review(judge, act, ask, out)
+        return code, act, out.getvalue(), prompts
+
+    def test_selection(self):
+        sel = logban.parse_selection
+
+        self.assertEqual(sel("a", 4), [1, 2, 3, 4])
+        self.assertEqual(sel("ALL\n", 2), [1, 2])
+
+        for none in ("", "\n", "n", "none", "q"):
+            self.assertEqual(sel(none, 4), [])
+
+        self.assertEqual(sel("1-3,7", 9), [1, 2, 3, 7])
+        self.assertEqual(sel(" 2  1, 2-2 ", 3), [1, 2])
+
+        for bad in ("0", "5", "3-1", "1-", "x", "1;2", "-1", "a,1"):
+            self.assertIsNone(sel(bad, 4), bad)
+
+    def test_table(self):
+        code, act, out, _ = self.review(["n\n"])
+        rows = out.splitlines()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(act.calls, [])
+        self.assertIn("address", rows[0])
+        # one row per address, most costly first; the browser is absent
+        self.assertRegex(rows[1], r"^  1  203\.0\.113\.7 +2 +120 ")
+        self.assertRegex(rows[2], r"^  2  2001:db8::9 +1 +60 ")
+        self.assertRegex(rows[3], r"^  3  203\.0\.113\.8 +1 +60 ")
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[4], "nothing banned")
+
+    def test_pick(self):
+        code, act, out, prompts = self.review(["9\n", "1,3\n"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("pick 1 to 3, a or n", out)
+        self.assertEqual(act.calls,
+                         [("203.0.113.7", 120), ("203.0.113.8", 60)])
+        self.assertIn("ban 203.0.113.8 ttl=60\n", out)
+
+    def test_eof_bans_nothing(self):
+        code, act, out, _ = self.review([])
+        self.assertEqual((code, act.calls), (0, []))
+        self.assertIn("nothing banned", out)
+
+    def test_failure(self):
+        code, act, out, _ = self.review(
+            ["a\n"], act=Recorder(fail='"error: refused"'))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(act.calls), 3)
+        self.assertIn('error="error: refused"', out)
+
+    def test_dry(self):
+        code, _, out, _ = self.review(["a\n"], act=logban.dry_run)
+        self.assertEqual(code, 0)
+        self.assertIn("would ban 203.0.113.7 ttl=120", out)
+
+    def test_nothing(self):
+        judge = logban.Judge(config(), logban.dry_run, out=io.StringIO())
+        judge.history = []
+        out = io.StringIO()
+        self.assertEqual(logban.review(judge, Recorder(), None, out), 0)
+        self.assertEqual(out.getvalue(), "nothing to ban\n")
+
+    def test_not_with_follow(self):
+        err = io.StringIO()
+        saved, sys.stderr = sys.stderr, err
+
+        try:
+            conf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "logban.conf")
+            self.assertEqual(logban.main(["-c", conf, "-r", "-f", "x.log"]),
+                             1)
+
+        finally:
+            sys.stderr = saved
+
+        self.assertIn("--review", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

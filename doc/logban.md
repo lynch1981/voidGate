@@ -48,8 +48,8 @@ In scope:
   this format.
 - **Per-address rules** over a sliding window, with timed drops through
   the existing `drop <ip> ttl=<sec>` (l7-bridge §4).
-- **Replay**, to tune thresholds on old logs, and **follow**, to enforce
-  live.
+- **Replay**, to tune thresholds on old logs, **review**, to ban only
+  what a person confirms, and **follow**, to enforce live.
 - **A CDN in front:** its edges are never banned (§8).
 
 Out of scope:
@@ -259,7 +259,33 @@ and a returning bot pays more each time.
 - A ban that fails (daemon down, refused) is printed with `error=`,
   is **not** counted as an offense, and is retried at the next step.
 
-### 7.3 In the daemon
+### 7.3 Review
+
+`--review` (`-r`) replays the logs as a dry run, then shows one row per
+address that would have been banned and asks which ones to ban:
+
+```
+  #  address       bans     ttl  costly  ratio   backend  rule          seen (UTC)
+  1  2001:db8::e      2    1200     315   0.98    378.2s  ratio         10-03 10:47 .. 10:57
+  2  203.0.113.3      2    1200     310   0.99    372.1s  ratio         10-03 10:07 .. 10:17
+ban which? [a]ll, [n]one, or numbers like 1-3,7: 1
+ban 2001:db8::e ttl=1200
+```
+
+- Rows are sorted by costly requests, most first. `bans`, `costly`,
+  `backend` and `seen` add up every time the replay banned the address.
+  `ttl` is the replay's last one, doubled for each repeat (§7.1).
+- The answer is `a`, `n` (or Enter), or row numbers and ranges. Anything
+  else asks again. End of input or Ctrl-C bans nothing.
+- The prompt reads `/dev/tty`, not stdin, so logs can be piped in. With
+  no terminal, `--review` exits 1.
+- The picked addresses are banned when you answer, for their full ttl
+  from that moment. With `-n`, they are only printed as `would ban`.
+- Exit 1 if any picked ban failed.
+- Not with `-f`: a prompt would stop the reading loop. For live
+  enforcement, tune with `-r` first, then run `-f`.
+
+### 7.4 In the daemon
 
 logban's drops are ordinary timed drops (reason 4), so l7-bridge §5 applies
 as is:
@@ -345,6 +371,9 @@ stderr:
 | `allow_file not reloaded, keeping N networks: ...` | the change did not parse |
 | `skip <ip> crawler\|allow total=N costly=N` | with `-v`, a verified crawler, or an address allowlisted mid-window (§6.2), matched a rule |
 | `N lines, N unparsed, N allowed` | at the end of a replay, with `-v` or `--top-paths` |
+
+`--review` prints its table and results on stdout instead of ban lines
+(§7.3).
 
 `--top-paths N` then prints the N paths with the most backend seconds,
 or the most requests when the log has no timing fields.
@@ -466,6 +495,7 @@ no daemon, about one second.
 | `AllowFileTest` | allowlisted addresses kept out of the window but in the path report, one allowlist check per address; missing or broken file at startup; reload on replace; broken update keeps the old list; counts made before the reload excused |
 | `SocketTest` | the exact `drop <ip> ttl=N` sent; `ok`, a refusal, no daemon |
 | `FollowTest` | follow across a rename rotation, counts kept |
+| `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
 Not covered: a real daemon. logban sends the same line that `voidgatectl

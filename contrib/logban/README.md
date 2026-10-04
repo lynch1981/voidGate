@@ -43,6 +43,9 @@ python3 logban.py -n --top-paths 20 -c logban.conf /var/log/nginx/access.log
 # Replay old logs (gzip works): print what would have been banned.
 python3 logban.py -n -c logban.conf /var/log/nginx/access.log.*.gz
 
+# Replay, list the would-be bans, ban only the ones you pick.
+sudo python3 logban.py -r -c logban.conf /var/log/nginx/access.log
+
 # Live and dry, then live and enforcing (root or ctl_socket_group).
 python3 logban.py -n -f -c logban.conf /var/log/nginx/access.log
 sudo python3 logban.py -f -c logban.conf /var/log/nginx/access.log
