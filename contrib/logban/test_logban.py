@@ -5,6 +5,7 @@
 """Unit tests for logban.py. No root, no daemon: python3 test_logban.py"""
 
 import io
+import json
 import os
 import socket
 import sys
@@ -1659,6 +1660,142 @@ class ClusterTest(unittest.TestCase):
 
         # bounds are only checked when clusters are on
         ConfigTest.load(self, "costly = x\ncluster_ratio = 5\n")
+
+
+def jline(ip, t, path, method="GET", status=200, ua="Mozilla/5.0",
+          rt=0.1, urt=0.1, **extra):
+    """The same request as line(), the way log_format escape=json writes
+    it (numbers as numbers, like the sample in data/)."""
+
+    d = {"time_local": datetime.fromtimestamp(t, timezone.utc).strftime(
+             "%d/%b/%Y:%H:%M:%S +0000"),
+         "remote_addr": ip, "remote_user": "-",
+         "request": "%s %s HTTP/1.1" % (method, path), "status": status,
+         "body_bytes_sent": 512, "http_referer": "-",
+         "http_user_agent": ua, "request_time": rt,
+         "upstream_response_time": urt}
+    d.update(extra)
+    return json.dumps(d) + "\n"
+
+
+class JsonTest(unittest.TestCase):
+
+    def test_same_as_combined(self):
+        for kw in ({"ip": "203.0.113.7", "t": T0, "path": "/search?q=1"},
+                   {"ip": "2001:db8::7", "t": T0 + 1, "path": "/login",
+                    "method": "POST", "status": 401},
+                   {"ip": "198.51.100.1", "t": T0 + 2, "path": "/",
+                    "status": 404, "ua": "curl/8"}):
+            c = logban.parse_line(line(rt="0.1", urt="0.1", **kw))
+            j = logban.parse_line(jline(**kw))
+            self.assertEqual(j, c)
+
+    def test_values(self):
+        r = logban.parse_line(jline("::1", T0, "/x", rt=0.9,
+                                    urt="0.5, 0.25 : 0.125"))
+        self.assertEqual(r[logban.F_COST], 0.875)
+        # urt "-" (nginx answered itself): rt; both absent: None
+        self.assertEqual(logban.parse_line(jline("::1", T0, "/", rt=0.002,
+                                                 urt="-"))[3], 0.002)
+        d = json.loads(jline("::1", T0, "/"))
+        del d["request_time"], d["upstream_response_time"]
+        self.assertIsNone(logban.parse_line(json.dumps(d))[3])
+        # ja4 from either name; "-" is none
+        self.assertEqual(logban.parse_line(jline("::1", T0, "/",
+                                                 ja4=IOS))[5], IOS)
+        self.assertEqual(logban.parse_line(jline("::1", T0, "/",
+                                                 http_ssl_ja4=IOS))[5], IOS)
+        self.assertEqual(logban.parse_line(jline("::1", T0, "/",
+                                                 ja4="-"))[5], "")
+
+    def test_time_fields(self):
+        d = json.loads(jline("::1", T0, "/"))
+        del d["time_local"]
+
+        for extra in ({"time_iso8601": "2026-10-03T10:00:00+00:00"},
+                      {"time_iso8601": "2026-10-03T18:00:00+08:00"},
+                      {"msec": "%.3f" % T0}, {"msec": T0}):
+            r = logban.parse_line(json.dumps(dict(d, **extra)))
+            self.assertEqual(r[1], T0, extra)
+
+        self.assertIsNone(logban.parse_line(json.dumps(d)))
+
+    def test_method_and_uri(self):
+        d = json.loads(jline("::1", T0, "/"))
+        del d["request"]
+        d.update(request_method="POST", request_uri="/login?next=/")
+        r = logban.parse_line(json.dumps(d))
+        self.assertEqual((r[6], r[2]), ("POST", "/login"))
+
+    def test_unparsed(self):
+        for bad in ('{"remote_addr": "::1"\n',            # cut short
+                    '{"time_local": "03/Oct/2026:10:00:00 +0000"}\n',
+                    '{"remote_addr": "::1", "time_local": "yesterday"}\n',
+                    '{"remote_addr": "::1", "time_local": [1]}\n',
+                    '{"remote_addr": "::1", "msec": "x"}\n'):
+            self.assertIsNone(logban.parse_line(bad), bad)
+
+    def test_custom_fields(self):
+        # behind realip: the peer is in realip_remote_addr
+        cfg = config()
+        cfg.set("json_ip", "realip_remote_addr")
+        cfg.set("json_ua", "ua, http_user_agent")
+        cfg.check()
+        s = jline("198.51.100.9", T0, "/", realip_remote_addr="203.0.113.7",
+                  ua="custom")
+        r = logban.parse_line(s, cfg.json_fields)
+        self.assertEqual((r[0], r[4]), ("203.0.113.7", "custom"))
+
+        with self.assertRaises(logban.ConfigError):
+            ConfigTest.load(self, "costly = x\njson_ip = remote_addr,\n")
+
+    def test_same_bans(self):
+        # one replay in each format, and both mixed in one file
+        cfg = watch_config(*SCAN, "honey = ^/\\.env")
+        reqs = ([dict(ip="203.0.113.7", t=T0 + i * 0.2, path="/search")
+                 for i in range(150)]
+                + [dict(ip="203.0.113.8", t=T0 + i * 0.3, path="/x%d" % i,
+                        status=404) for i in range(60)]
+                + [dict(ip="203.0.113.9", t=T0 + 5, path="/.env")]
+                + [dict(ip="198.51.100.1", t=T0 + i, path="/")
+                   for i in range(50)])
+        reqs.sort(key=lambda r: r["t"])
+        c = run(cfg, [line(rt="0.1", urt="0.1", **r) for r in reqs])[1]
+        j = run(cfg, [jline(**r) for r in reqs])[1]
+        m = run(cfg, [jline(**r) if i % 2 else line(rt="0.1", urt="0.1", **r)
+                      for i, r in enumerate(reqs)])[1]
+        self.assertEqual(c.count(" ban "), 3)
+        self.assertEqual(j, c)
+        self.assertEqual(m.count(" ban "), 3)
+
+    def test_sample_in_data(self):
+        # the sample shipped in data/: every line parses
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "data", "clickHouse.access.log")
+
+        if not os.path.exists(path):
+            self.skipTest("no data/clickHouse.access.log")
+
+        with open(path) as f:
+            lines = f.readlines()
+
+        self.assertTrue(all(logban.parse_line(l) for l in lines))
+
+
+class TimeTest(unittest.TestCase):
+
+    def test_fast_path_matches_strptime(self):
+        for s in ("03/Oct/2026:10:00:00 +0000", "29/Feb/2028:23:59:59 -0700",
+                  "01/Jan/1970:00:00:00 +0530", "31/Dec/2037:12:00:00 +1400"):
+            self.assertEqual(logban.parse_time_local(s), datetime.strptime(
+                s, "%d/%b/%Y:%H:%M:%S %z").timestamp(), s)
+
+    def test_rejects(self):
+        for s in ("32/Oct/2026:10:00:00 +0000", "03/Foo/2026:10:00:00 +0000",
+                  "03/Oct/2026:24:00:00 +0000", "03/Oct/2026 10:00:00 +0000",
+                  ""):
+            with self.assertRaises(ValueError, msg=s):
+                logban.parse_time_local(s)
 
 
 if __name__ == "__main__":

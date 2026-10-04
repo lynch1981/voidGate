@@ -80,6 +80,12 @@ access_log /var/log/nginx/access.log logban;
 The first field must be the TCP peer: with the realip module on, log
 `$realip_remote_addr` there.
 
+JSON logs (`log_format ... escape=json`) work too, line by line, with
+nginx's field names (`remote_addr`, `time_local`, `request`, `status`,
+`http_user_agent`, `request_time`, `upstream_response_time`). Other names:
+the `json_*` keys in `logban.conf`
+([design §4.2](../../doc/logban.md#42-json)).
+
 ## Run
 
 ```sh

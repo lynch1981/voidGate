@@ -22,9 +22,11 @@ See README.md next to this file.
 """
 
 import argparse
+import calendar
 import collections
 import gzip
 import ipaddress
+import json
 import math
 import os
 import re
@@ -51,6 +53,7 @@ NUMBER = re.compile(r'\d+(?:\.\d+)?')
 # ja4=t13d1516h2_8daaf6152771_02713d6af862; "-" or empty when the
 # connection had no TLS or the module did not run.
 JA4 = re.compile(r'\bja4=([0-9a-z_]+)')
+JA4_VALUE = re.compile(r'[0-9a-z_]+')
 # Fields of a parsed line. A plain tuple: a namedtuple per line cost 20 %
 # of a replay.
 F_IP, F_T, F_PATH, F_COST, F_UA, F_JA4, F_METHOD, F_STATUS = range(8)
@@ -298,6 +301,18 @@ class Config:
         "cluster_ratio": (float, 0.9),
         "cluster_member_min": (int, 3),
         "socket": (str, VG_SOCK_PATH),
+        # JSON log lines: the field holding each value, first one present
+        # wins. Defaults are nginx's variable names.
+        "json_ip": (str, "remote_addr"),
+        "json_time": (str, "time_local, time_iso8601, msec"),
+        "json_request": (str, "request"),
+        "json_method": (str, "request_method"),
+        "json_uri": (str, "request_uri, uri"),
+        "json_status": (str, "status"),
+        "json_ua": (str, "http_user_agent"),
+        "json_rt": (str, "request_time"),
+        "json_urt": (str, "upstream_response_time"),
+        "json_ja4": (str, "ja4, http_ssl_ja4"),
     }
     LISTS = ("costly", "skip", "honey", "allow", "allow_file", "crawler")
     # rule names a watch would be confused with
@@ -422,6 +437,8 @@ class Config:
         if not 1 <= self.ttl <= self.max_ttl <= MAX_TTL:
             raise ConfigError("need 1 <= ttl <= max_ttl <= %d" % MAX_TTL)
 
+        self.json_fields = json_fields(self)
+
         if self.cluster_min_addresses:
             if self.cluster_min_addresses < 2:
                 raise ConfigError("cluster_min_addresses is 0 (off) or at"
@@ -516,23 +533,160 @@ class Config:
 _time_cache = {}
 
 
+MONTHS = {m: i for i, m in enumerate(calendar.month_abbr) if m}
+
+
 def parse_time(s):
+    """$time_local, "03/Oct/2026:10:00:00 +0000", as epoch seconds."""
+
     t = _time_cache.get(s)
 
     if t is None:
         if len(_time_cache) > 4096:
             _time_cache.clear()
 
-        t = datetime.strptime(s, "%d/%b/%Y:%H:%M:%S %z").timestamp()
-        _time_cache[s] = t
+        t = _time_cache[s] = parse_time_local(s)
 
     return t
 
 
-def parse_line(line):
+def parse_time_local(s):
+    # nginx's layout is fixed: slicing is 10x faster than strptime, which
+    # ran for nearly every line of a log with few requests per second.
+    try:
+        if len(s) == 26 and s[2] == "/" and s[6] == "/" and s[11] == ":" \
+                and s[20] == " " and s[21] in "+-":
+            day, hour, minute, sec = (int(s[0:2]), int(s[12:14]),
+                                      int(s[15:17]), int(s[18:20]))
+
+            if 1 <= day <= 31 and hour < 24 and minute < 60 and sec < 61:
+                offset = int(s[22:24]) * 3600 + int(s[24:26]) * 60
+
+                return (calendar.timegm((int(s[7:11]), MONTHS[s[3:6]], day,
+                                         hour, minute, sec))
+                        - (offset if s[21] == "+" else -offset))
+
+    except (KeyError, ValueError):
+        pass
+
+    # anything else: strptime decides, and raises ValueError if bad
+    return datetime.strptime(s, "%d/%b/%Y:%H:%M:%S %z").timestamp()
+
+
+def json_fields(cfg):
+    """{json_<key> suffix: [field names]} from a Config's json_* keys."""
+
+    fields = {}
+
+    for key in JSON_KEYS:
+        names = [n.strip() for n in getattr(cfg, "json_" + key).split(",")]
+
+        if not all(names):
+            raise ConfigError("json_%s: empty field name" % key)
+
+        fields[key] = names
+
+    return fields
+
+
+JSON_KEYS = ("ip", "time", "request", "method", "uri", "status", "ua", "rt",
+             "urt", "ja4")
+
+
+def json_value(d, names):
+    """The first of names present in d and not "-" or empty, as a
+    string; "" when none is."""
+
+    for name in names:
+        v = d.get(name)
+
+        if v is not None and v != "-" and v != "":
+            return v if isinstance(v, str) else str(v)
+
+    return ""
+
+
+def json_time(d, names):
+    for name in names:
+        v = d.get(name)
+
+        if v is None or v == "" or v == "-":
+            continue
+
+        if name == "msec" or isinstance(v, (int, float)):
+            return float(v)
+
+        if "/" in v:                        # $time_local
+            return parse_time(v)
+
+        t = _time_cache.get(v)              # $time_iso8601
+
+        if t is None:
+            if len(_time_cache) > 4096:
+                _time_cache.clear()
+
+            t = _time_cache[v] = datetime.fromisoformat(v).timestamp()
+
+        return t
+
+    raise ValueError("no time")
+
+
+def seconds(*values):
+    """Backend seconds from urt, else rt: "0.5", "-", a number, or one
+    value per upstream tried ("0.5, 0.2 : 0.1"). None when absent."""
+
+    for v in values:
+        found = NUMBER.findall(v)
+
+        if found:
+            return sum(float(x) for x in found)
+
+    return None
+
+
+def parse_json(line, fields):
+    """A JSON log line (log_format escape=json), as parse_line()."""
+
+    try:
+        d = json.loads(line)
+        ip = json_value(d, fields["ip"])
+        t = json_time(d, fields["time"])
+
+    # not JSON, not an object, or a time field of the wrong type
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+    if not ip:
+        return None
+
+    parts = json_value(d, fields["request"]).split(" ")
+
+    if len(parts) == 3:
+        method, path = parts[0], parts[1].split("?", 1)[0]
+
+    else:
+        method = json_value(d, fields["method"])
+        path = json_value(d, fields["uri"]).split("?", 1)[0]
+
+    ja4 = json_value(d, fields["ja4"])
+
+    return (ip, t, path,
+            seconds(json_value(d, fields["urt"]), json_value(d, fields["rt"])),
+            json_value(d, fields["ua"]),
+            ja4 if JA4_VALUE.fullmatch(ja4) else "",
+            method, json_value(d, fields["status"]))
+
+
+def parse_line(line, fields=None):
     """Return (ip, epoch, path, cost, user agent, ja4, method, status):
     cost is backend seconds or None; user agent, ja4 and method are ""
-    when absent. None when the line does not parse."""
+    when absent. None when the line does not parse. A line starting with
+    "{" is JSON, read with fields (json_fields(); nginx's names when
+    None); any other line is combined."""
+
+    if line[:1] == "{":
+        return parse_json(line, fields or DEFAULT_JSON_FIELDS)
 
     m = LINE.match(line)
 
@@ -556,16 +710,7 @@ def parse_line(line):
         method, path = "", ""
 
     timing = dict(TIMING.findall(rest))
-    cost = None
-
-    # urt is "0.010", "-", or one value per upstream tried
-    # ("0.010, 0.020 : 0.003"); fall back to rt.
-    for key in ("urt", "rt"):
-        values = NUMBER.findall(timing.get(key, ""))
-
-        if values:
-            cost = sum(float(v) for v in values)
-            break
+    cost = seconds(timing.get("urt", ""), timing.get("rt", ""))
 
     ja4 = ""
 
@@ -574,6 +719,9 @@ def parse_line(line):
         ja4 = m.group(1) if m else ""
 
     return ip, t, path, cost, ua or "", ja4, method, status
+
+
+DEFAULT_JSON_FIELDS = json_fields(Config())
 
 
 class Window:
@@ -866,7 +1014,7 @@ class Judge:
         self.explain = None         # Explain: one address (--explain)
 
     def feed(self, line):
-        r = parse_line(line)
+        r = parse_line(line, self.cfg.json_fields)
 
         if r is None:
             self.skipped += 1

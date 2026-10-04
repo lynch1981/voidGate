@@ -101,7 +101,11 @@ for i in range(1500):
 # a browser: searches, but mostly cheap pages
 for i in range(200):
     emit("198.51.100.20", i * 0.2, "/search" if i % 4 == 0 else "/")
-emit("198.18.0.5", 12, "/.env")
+# the honey probe as a JSON line (log_format escape=json), in the same file
+out.append((12, '{"time_local":"%s","remote_addr":"198.18.0.5",'
+                '"request":"GET /.env HTTP/1.1","status":404}\n'
+                % (t0 + timedelta(seconds=12)).strftime(
+                    "%d/%b/%Y:%H:%M:%S +0000")))
 # a wide botnet: 12 addresses, 10 searches each, one user agent
 for k in range(12):
     for i in range(10):

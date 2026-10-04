@@ -153,7 +153,42 @@ from its README), append the fingerprint too:
 
 Lines that do not parse are counted and skipped.
 
-### 4.2 Reading
+### 4.2 JSON
+
+A line that starts with `{` is read as JSON, as `log_format ...
+escape=json` writes it; any other line as `combined`, so a file may mix
+both (a format change mid-file, or two vhosts). No config is needed when
+the fields carry nginx's variable names:
+
+```nginx
+log_format logban_json escape=json '{"time_local":"$time_local",'
+    '"remote_addr":"$remote_addr","request":"$request","status":$status,'
+    '"http_user_agent":"$http_user_agent","request_time":$request_time,'
+    '"upstream_response_time":"$upstream_response_time",'
+    '"ja4":"$http_ssl_ja4"}';
+```
+
+| Value | Fields tried, first present wins | Key to change it |
+|---|---|---|
+| address | `remote_addr` | `json_ip` |
+| time | `time_local`, `time_iso8601`, `msec` | `json_time` |
+| request | `request`; else `request_method` + `request_uri` or `uri` | `json_request`, `json_method`, `json_uri` |
+| status | `status` | `json_status` |
+| user agent | `http_user_agent` | `json_ua` |
+| backend seconds | `upstream_response_time`, else `request_time` | `json_urt`, `json_rt` |
+| JA4 | `ja4`, `http_ssl_ja4` | `json_ja4` |
+
+Each key takes one field name or several, comma-separated, tried in
+order: behind realip, `json_ip = realip_remote_addr` (§8). Values may be
+strings or numbers; `-` and empty count as absent, as in `combined`. A
+line that is not valid JSON, or lacks an address or a time, is
+unparsed. A syslog prefix before the `{` is not stripped.
+
+A line parsed from JSON is the same tuple as from `combined`: tests check
+both give the same bans, and the sample `data/clickHouse.access.log`
+(14,743 lines) gives identical reports read as JSON or converted.
+
+### 4.3 Reading
 
 - **Replay:** one or more files, read in order. `.gz` and `-` (stdin)
   work. The clock is the log's time, so an hour of log replays in seconds
@@ -748,6 +783,7 @@ browsers, a CGNAT address and 15 bots.
 | | |
 |---|---|
 | replay | 5.5 s, about 60k lines/s |
+| parsing alone, a log with a new second on most lines (`data/`) | `combined` 83k lines/s, JSON 46k lines/s |
 | bans | all 15 bots, each about 30 s into its attack; no browser, no CGNAT |
 | allowlist filter (§6.1) | about 8 % of that time |
 | one `ua:` profile (§5.4) | about 20 % more: a regex on every line |
@@ -919,12 +955,14 @@ integration scripts.
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ExplainTest` | under, fires and BAN rows with their times, folded banned steps, summary; the same bans as a normal run; `under:` reasons (costly share, backend); allowlisted: never judged; verified crawler: exempt; honey, skipped, two profiles and a watch in one replay; watch ratio reason; not in the log; CLI: IPv6 normalized, the config's socket never used, bad address, refused with `-f` and `--review` |
 | `ClusterTest` | a 30-address botnet each under every threshold: no ban by per-address rules, all banned by the cluster, ban line with size, ja4 and ua; user agent alone without `ja4=`; 50 browsers on one stack pass; search-only users inside a browser cluster pass; a member that browses and one with 2 costly requests pass; below `cluster_min_addresses`, below `cluster_min_costly`, spread over 10 minutes; ratio-off profiles not clustered; allowlisted not counted, verified crawlers not banned; off by default; `--explain` rows; config bounds only when on. Each of the three safety conditions was removed in turn and a test failed. |
+| `JsonTest` | the same tuple as `combined` for the same request; `urt` with several upstreams, `-` falling back to `rt`, both absent; `ja4` from either name, `-` as none; `time_iso8601` with offsets and `msec` as string or number; `request_method` + `request_uri`; unparsed (cut short, no address, bad or wrong-typed time); `json_*` keys; the same bans in each format and mixed in one file; every line of the `data/` sample parses |
+| `TimeTest` | the `time_local` fast path equals `strptime` (also checked on 20,000 random stamps and offsets while writing it); out-of-range and misshapen stamps rejected |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
 | `t/integration/logban.sh` | Covers |
 |---|---|
-| replay | ratio bans (IPv4 and IPv6), a honey ban, a `scan` watch ban and a 12-address cluster land as `reason=4` drops; a browser is not dropped; a flood from the protected `local_networks` address is asked once (one logban line with `retry_after=600s`, one `refuse drop` line in the daemon log), not every step |
+| replay | ratio bans (IPv4 and IPv6), a honey ban (from a JSON line in the same file), a `scan` watch ban and a 12-address cluster land as `reason=4` drops; a browser is not dropped; a flood from the protected `local_networks` address is asked once (one logban line with `retry_after=600s`, one `refuse drop` line in the daemon log), not every step |
 | follow | daemon stopped: a live flood's ban fails with `error=` and is retried every step; daemon started: the next retry lands the drop |
 
 That XDP then drops the address is `t/drop-ttl-xdp.t`'s job: logban sends
