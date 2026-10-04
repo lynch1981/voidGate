@@ -225,6 +225,25 @@ class JudgeTest(unittest.TestCase):
         self.assertGreater(len(act.calls), 1)
         self.assertIn("error=", out)
 
+    def test_refused_held_for_ttl(self):
+        # 5 minutes of flood from an address the daemon protects: one
+        # refusal, not one per step, and no offense counted
+        act = Recorder(fail=logban.Refused('"error: refused or map update'
+                                           ' failed"'))
+        _, out, judge = run(config(), bot("198.51.100.10", n=1500), act=act)
+
+        self.assertEqual(len(act.calls), 1)
+        self.assertEqual(out.count("\n"), 1)
+        self.assertIn('error="error: refused or map update failed"'
+                      ' retry_after=600s', out)
+        self.assertNotIn("198.51.100.10", judge.offenses)
+
+    def test_refused_tried_again_after_ttl(self):
+        act = Recorder(fail=logban.Refused('"error: refused"'))
+        lines = bot("198.51.100.10") + bot("198.51.100.10", start=T0 + 900)
+        run(config(), lines, act=act)
+        self.assertEqual([t for _, t in act.calls], [600, 600])
+
     def test_late_line_counts(self):
         # nginx logs when a request ends: older stamps arrive late
         lines = bot("203.0.113.7", n=100, start=T0 + 30)
@@ -309,9 +328,20 @@ class SocketTest(unittest.TestCase):
         err = logban.ctl_drop(path)("2001:db8::1", 60)
         th.join()
         self.assertIn("refused", err)
+        self.assertIsInstance(err, logban.Refused)
+
+    def test_no_reply(self):
+        # the daemon closed without answering: not a refusal
+        path, _, th = self.serve(b"")
+        err = logban.ctl_drop(path)("2001:db8::1", 60)
+        th.join()
+        self.assertEqual(err, '"no reply"')
+        self.assertNotIsInstance(err, logban.Refused)
 
     def test_no_daemon(self):
-        self.assertIsNotNone(logban.ctl_drop("/nonexistent/sock")("::2", 1))
+        err = logban.ctl_drop("/nonexistent/sock")("::2", 1)
+        self.assertIsNotNone(err)
+        self.assertNotIsInstance(err, logban.Refused)
 
 
 class FollowTest(unittest.TestCase):

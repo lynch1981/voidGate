@@ -657,21 +657,28 @@ class Judge:
         err = self.act(ip, ttl)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
 
+        held = isinstance(err, Refused)
+
         self.out.write("%s ban %s ttl=%d offense=%d total=%d costly=%d"
-                       " ratio=%.2f backend=%.1fs rule=%s%s%s\n"
+                       " ratio=%.2f backend=%.1fs rule=%s%s%s%s\n"
                        % (stamp, ip, ttl, count + 1, total, costly,
                           costly / total, cost, rule, note,
-                          " error=" + err if err else ""))
+                          " error=" + err if err else "",
+                          " retry_after=%ds" % ttl if held else ""))
         self.out.flush()
 
-        if err:
-            return              # retried at the next step
+        if err and not held:
+            return              # socket error: retried at the next step
 
-        self.offenses[ip] = (count + 1, now)
+        if not err:
+            self.offenses[ip] = (count + 1, now)
+
+            if self.history is not None:
+                self.history.append((now, ip, ttl, total, costly, cost,
+                                     rule))
+
+        # Banned, or refused: either way not judged again for ttl.
         self.banned[ip] = now + ttl
-
-        if self.history is not None:
-            self.history.append((now, ip, ttl, total, costly, cost, rule))
 
         self.win.remove([(ip, i) for i in range(len(cfg.profiles))])
 
@@ -875,6 +882,12 @@ def dry_run(ip, ttl):
     return None
 
 
+class Refused(str):
+    """An error the daemon itself replied (a protected address, a full
+    drop list, a failed map write): it would answer the same again, so
+    the address is held for its ttl instead of retried every step."""
+
+
 def ctl_drop(path):
     def drop(ip, ttl):
         try:
@@ -898,7 +911,13 @@ def ctl_drop(path):
 
         reply = reply.decode(errors="replace").strip()
 
-        return None if reply == "ok" else '"%s"' % (reply or "no reply")
+        if reply == "ok":
+            return None
+
+        if not reply:
+            return '"no reply"'         # daemon died mid-request: retry
+
+        return Refused('"%s"' % reply)
 
     return drop
 

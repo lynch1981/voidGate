@@ -322,8 +322,9 @@ honey_ttl = 3600
   everyone behind it for a day on its first probe.
 - **Refused patterns.** A `honey` regex that matches `/` or an empty path
   (a malformed request line) would ban every client: config error.
-- A failed ban is not retried on a timer. Scanners send many probes, and
-  the next one tries again.
+- A ban that fails on the socket is not retried on a timer. Scanners
+  send many probes, and the next one tries again. A refused one is held
+  like any other (§7.2).
 
 Do not list a path a real page links to, even a hidden link: browser
 prefetching, accessibility tools and mail link scanners follow links. A
@@ -405,8 +406,19 @@ and a returning bot pays more each time.
   lines keep coming (nothing really dropped them), so expect a second ban
   with a doubled ttl. Live, its packets are dropped at XDP and it
   disappears from the log.
-- A ban that fails (daemon down, refused) is printed with `error=`,
-  is **not** counted as an offense, and is retried at the next step.
+- A ban that fails is printed with `error=` and is **not** counted as an
+  offense. What happens next depends on who failed:
+
+  | Failure | Next |
+  |---|---|
+  | the socket: daemon down, restarting, or it closed without a reply | retried at every step while the rule still fires |
+  | the daemon replied `error: ...`: a protected address (`local_*`, `allow_*`), a full drop list, a failed map write | **held** for its ttl, like a ban: the line ends `retry_after=<ttl>s`, and the address is not judged again until then |
+
+  The daemon gives one reply for all three refusals, so logban cannot
+  tell a protected address from a full list. Holding is right for both:
+  the same request would get the same answer at the next step, and a
+  protected address would otherwise be refused, and logged by both
+  sides, every 10 s for as long as it sends.
 
 ### 7.3 Review
 
@@ -512,7 +524,11 @@ stdout, one line per ban:
 The time is the end of the judged window, from the log's clock; for
 `rule=honey`, the probe's own time, followed by `path=<the probe>`. A
 failed ban adds `error="..."`, quoting the daemon's reply or the socket
-error.
+error, and a refusal then `retry_after=<ttl>s` (§7.2):
+
+```
+2026-10-03T10:00:20Z ban 198.51.100.10 ttl=600 ... rule=ratio error="error: refused or map update failed" retry_after=600s
+```
 
 stderr:
 
@@ -626,7 +642,7 @@ The offense counts are kept for every address ever banned (§15).
 | Failure | Effect |
 |---|---|
 | daemon down, or socket not reachable | each ban printed with `error=`, retried every step until it succeeds |
-| daemon refuses (address in `local_*` / `allow_*`, drop list full) | same: retried every step (§15) |
+| daemon refuses (address in `local_*` / `allow_*`, drop list full, map write failed) | printed once with `retry_after=`, held for the ttl, then judged again (§7.2) |
 | honey ban fails | printed with `error=`; the scanner's next probe tries again |
 | log rotated | follow reopens the new file; window and bans kept |
 | log deleted | follow waits for it to reappear |
@@ -698,9 +714,6 @@ Limits:
 
 Future work:
 
-- **Stop retrying a refusal.** A drop the daemon refuses
-  (`local_*` / `allow_*`) will be refused at every step. Remember it for
-  the ttl instead.
 - **A CDN-API action**, banning by real client address at the CDN
   (Cloudflare IP Access Rules), with the Python client library from §14.
 - **More CDN providers** in `cdn_allow.py`.
@@ -720,10 +733,10 @@ no daemon, about one second.
 | Test class | Covers |
 |---|---|
 | `ParseTest` | combined format, `urt` with several upstreams, `urt=-` falling back to `rt`, IPv6, timezones, garbage and malformed request lines |
-| `JudgeTest` | bot banned, browser not; IPv6; `min_costly` and `ratio` boundaries; sliding window; `slow_seconds`; rule `backend`; `skip`; `allow`; forward-confirmed crawler versus a fake; one ban per ttl; ttl doubling and `max_ttl`; `offense_memory`; failed ban retried; late lines; `--top-paths` |
+| `JudgeTest` | bot banned, browser not; IPv6; `min_costly` and `ratio` boundaries; sliding window; `slow_seconds`; rule `backend`; `skip`; `allow`; forward-confirmed crawler versus a fake; one ban per ttl; ttl doubling and `max_ttl`; `offense_memory`; failed ban retried; a refusal held for its ttl, logged once, no offense, judged again after; late lines; `--top-paths` |
 | `ConfigTest` | the example `logban.conf` loads; unknown keys, bad values and a config with nothing costly are errors |
 | `AllowFileTest` | allowlisted addresses kept out of the window but in the path report, one allowlist check per address; missing or broken file at startup; reload on replace; broken update keeps the old list; counts made before the reload excused |
-| `SocketTest` | the exact `drop <ip> ttl=N` sent; `ok`, a refusal, no daemon |
+| `SocketTest` | the exact `drop <ip> ttl=N` sent; `ok`; a daemon's `error:` reply is a `Refused`; no reply and no daemon are not |
 | `FollowTest` | follow across a rename rotation, counts kept |
 | `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked |
 | `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
