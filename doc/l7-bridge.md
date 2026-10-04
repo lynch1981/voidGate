@@ -74,8 +74,9 @@ The `AGENT.md` invariants still hold:
  │  log phase: resty.voidgate.ban()    │         │    drop <cidr> ttl=N         │
  │    ├─ shared dict: once per window  │         │  policy.c                    │
  │    └─ ngx.timer.at → cosocket ──────┼────────▶│    drop_add()    merge rules │
- │                                     │         │    drop list     pool+lists  │
- └─────────────────────────────────────┘         │    expire_drops() each tick  │
+ │  access phase: ban_now() ───────────┼────────▶│    drop list     pool+lists  │
+ │    └─ cosocket now, answer returned │         │    expire_drops() each tick  │
+ └─────────────────────────────────────┘         │                              │
                                                  └──────────────┬───────────────┘
                                                                 │ LPM map write
                                                  ┌──────────────▼───────────────┐
@@ -234,6 +235,8 @@ save that. Not worth it unless a profile says otherwise.
 
 ## 7. Logging
 
+### 7.1 The daemon
+
 A burst of bans used to write one timestamped line per drop and per
 expiry. On a VM whose clock source is HPET, each timestamp is a system
 call, and logging was over 90 % of the cost of a ban burst.
@@ -251,6 +254,30 @@ exactly what someone debugging a missing ban looks for. The added-drops
 summary is written at the start of the next tick, so drops lifted by a
 `disarm` in between are still reported. To see which addresses are banned,
 use `voidgatectl drops`.
+
+### 7.2 The gateway
+
+What reaches nginx's error log depends on where a ban fails:
+
+| Failure | Logged by nginx / ngx_lua | Logged by the client or caller |
+|---|---|---|
+| socket missing (voidgate not running) | `[crit] connect() to unix:/run/voidgate.sock failed (2: No such file or directory)` | `ban()`: its own line; `ban_now()` and methods: `nil, err` to the caller |
+| stale socket (voidgate died) | `[error] connect() ... failed (111: Connection refused)` | same |
+| daemon hung | ngx_lua's read-timeout line (`lua_socket_log_errors` on, the default) | same |
+| daemon refuses (protected address, full list, map failure) | nothing: a normal reply on a working socket | `ban()`: its own line; `ban_now()`: `nil, "error: ..."` |
+| bad input (`bad ip`, `bad ttl`) | nothing | `nil, err` from the call itself |
+
+The `connect()` lines come from nginx's core connect code, not from
+ngx_lua, so `lua_socket_log_errors off` does not silence them (checked: a
+missing socket logs at `crit`, a stale one at `error`). While voidgate is
+down, a failed ban therefore shows twice: nginx's line and the client's.
+The client and the example keep their line anyway, because the daemon's
+refusals, which matter most (a CDN address in `allow_networks`, a full
+list), appear nowhere else.
+
+The example logs at `ngx.ERR`, the level nginx's default `error_log` shows:
+an `ngx.WARN` line would vanish there. Its health timer logs nothing of its
+own; its connect attempt is what makes nginx log the failure once a minute.
 
 ## 8. State machine
 
@@ -355,8 +382,10 @@ final CIDR validation.
 each pattern in its phase: a health timer started in `init_worker_by_lua*`
 (methods in a timer), a honeypot path banned with `ban_now()` in
 `access_by_lua*`, `limit_req` 429s banned with `ban()` in `log_by_lua*`,
-and a local status page using the methods in `content_by_lua*`.
-`t/integration/example.sh` runs it as shipped.
+and a local status page using the methods in `content_by_lua*`. It listens
+on 8080, which a master started as an ordinary user can bind, sets
+`error_log ... error` explicitly (§7.2), and notes each duration next to
+its literal (`600, -- 10m`). `t/integration/example.sh` runs it as shipped.
 
 **Install.** `make install-lua` copies the file to
 `/usr/local/openresty/site/lualib/resty/`. For Kong or APISIX, set
@@ -409,14 +438,15 @@ proxy itself. Two things are required:
 
 | Failure | Effect |
 |---|---|
-| daemon down | `ban()` logs a connect error; requests are unaffected |
+| daemon down | nginx logs each failed connect (`[crit]` socket missing, `[error]` refused) and `ban()` its own line; `ban_now()` returns `nil, err`; requests are unaffected (§7.2) |
+| `ban_now()` or a method in a phase without cosockets | `nil, "no cosocket in this phase, use ban()"`; the caller's handler keeps running |
 | daemon restart, or `disarm` | bans are forgotten; the next offending request after the dedup window bans again |
 | gateway reload or crash | bans already sent stay until their ttl; nothing to clean up |
 | drop list full (`2 × drop_map_size`) | `drop <cidr> refused: drop list full`; the client gets `error: refused or map update failed` |
 | kernel map write fails | the record goes back to the pool; `error: refused or map update failed` |
 | kernel map delete fails | the record stays listed and expiry retries it next tick; `undrop` answers `error: map update failed` |
 | `lua_max_pending_timers` reached | `ngx.timer.at` fails; `ban()` returns `nil, err` |
-| daemon slow | the cosocket times out after `timeout`; only the timer waits, never a request |
+| daemon slow | the cosocket times out after `timeout` and ngx_lua logs it; with `ban()` only the timer waits, never a request; `ban_now()` waits up to `timeout` in its phase |
 
 ## 13. Behaviour changes
 
@@ -433,9 +463,12 @@ For anyone upgrading:
   per-tick summaries; use `-v` for the old detail.
 - **`drop <cidr> <junk>`** answers `error: bad ttl`; a misplaced or empty
   CIDR answers `error: bad cidr`.
-- **No permanent drop from Lua.** The removed LuaSocket client's
-  `drop(cidr)` made one; `resty.voidgate` requires a ttl on every drop.
-  `voidgatectl drop <cidr>` still makes a permanent drop.
+- **No permanent drop from Lua.** `drop(cidr)` without a ttl, in the
+  removed LuaSocket client and in the first version of `resty.voidgate`,
+  made one; every Lua drop now needs a ttl and `drop(cidr)` answers
+  `nil, "bad ttl"`. `voidgatectl drop <cidr>` still makes a permanent drop.
+- **Wrong phase:** a `resty.voidgate` method called where cosockets are
+  disabled returns `nil, err`; it used to raise and abort the handler.
 
 ## 14. Alternatives considered
 
@@ -488,7 +521,10 @@ For anyone upgrading:
 | `t/drop-ttl-xdp.t` | a timed drop really drops at XDP; SSH still passes |
 | `t/integration/daemon.sh` | `ctl_socket_group` chown, kept on reload, unknown group only warns; `voidgatectl` exits 1 on error |
 | `t/integration/resty.sh` + `resty.lua` | real nginx with workers as `nobody:nogroup`: every method against a real daemon, ttl required and validated, reload; `ban_now()` answers and local rejects; `ban()` from the log phase, 50 requests send exactly one ban; `ban_now()` from the log phase returns an error instead of aborting the handler |
-| `t/integration/example.sh` | `contrib/openresty/nginx.conf` as shipped: honeypot banned at once, a refused protected address logged, a 429 burst bans, the status page lists the drops |
+| `t/integration/example.sh` | `contrib/openresty/nginx.conf` as shipped, at its own `error_log` level: every honeypot path banned at once, a lookalike (`/.github`) left alone, a refused protected address logged, a 429 burst bans, the status page lists the drops; with voidgate stopped, the honeypot still answers 403 and logs the failed ban once |
+
+Negative checks in the shell tests use a `refute` helper: under `set -e`,
+`! cmd` never fails the script, so `! grep ...` would check nothing.
 
 `resty.sh` and `example.sh` need OpenResty, or nginx with `lua-nginx-module`
 (Ubuntu: `nginx-core libnginx-mod-http-lua`), and skip otherwise;
