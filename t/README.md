@@ -93,7 +93,7 @@ Everything test-related lives under `t/`. `prove -r t/` only picks up
 | `unit/cidr.c` | CIDR parser and config CIDR lists, built as `t/unit/cidr` (no root) |
 | `integration/daemon.sh` | daemon startup, detach, logging, pid file |
 | `integration/resty.sh` | OpenResty client in real nginx (`resty.lua` methods, `ban()`, `ctl_socket_group`); skips without nginx + lua module |
-| `integration/example.sh` | `contrib/openresty/nginx.conf` as shipped, with a python3 stub backend: honeypot, failed logins, 429s, status page; skips without nginx + lua module |
+| `integration/example.sh` | `contrib/openresty/nginx.conf` as shipped, with a python3 stub backend: honeypot, 429s, status page; skips without nginx + lua module |
 | `integration/netns.sh` | veth flood: IDLE → ACTIVE wake and drop |
 | `bench/` | manual load generators (`hping3`, `pktgen`) from a netns; not tests |
 

@@ -93,9 +93,9 @@ its trade-offs are in [`doc/l7-bridge.md`](doc/l7-bridge.md).
 
 A complete, tested OpenResty config is in
 [`contrib/openresty/nginx.conf`](contrib/openresty/nginx.conf): the shared
-dicts, a honeypot path banned with `ban_now()` in the access phase, failed
-logins and `limit_req` 429s banned with `ban()` in the log phase, a health
-timer, and a local status page.
+dict, a honeypot path banned with `ban_now()` in the access phase,
+`limit_req` 429s banned with `ban()` in the log phase, a health timer, and
+a local status page.
 
 `lua/resty/voidgate.lua` is a non-blocking client. It talks to the daemon's
 Unix socket with an `ngx.socket.tcp` cosocket and needs no other library.

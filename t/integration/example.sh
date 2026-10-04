@@ -1,8 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 # Run contrib/openresty/nginx.conf, as shipped, against a daemon in private
-# namespaces: the honeypot (ban_now in access), failed logins and 429s
-# (ban in log), the status page (methods in content) and the health timer.
+# namespaces: the honeypot (ban_now in access), 429s (ban in log), the
+# status page (methods in content) and the health timer.
 # Needs OpenResty, or nginx with lua-nginx-module, plus python3 for a stub
 # backend; set NGINX to pick the binary.
 set -euo pipefail
@@ -54,14 +54,14 @@ printf 'pid_file = %s\n' "$work/voidgate.pid" >> "$conf"
 printf 'ctl_socket_group = nogroup\n' >> "$conf"
 timeout --kill-after=2 10 "$root/voidgate" -d -c "$conf"
 
-# The application: 401 on /login, 200 elsewhere.
+# The application: 200 for everything.
 python3 - <<'PY' &
 import http.server
 
 
 class App(http.server.BaseHTTPRequestHandler):
     def reply(self):
-        self.send_response(401 if self.path.startswith("/login") else 200)
+        self.send_response(200)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -152,15 +152,6 @@ listed 198.18.1.1
 # A protected address is refused, logged, and still gets the 403.
 [[ $(code 127.0.0.1 "$url/.env") == 403 ]]
 grep -q 'voidgate ban_now 127.0.0.1: error: refused' "$prefix/error.log"
-
-# Failed logins: 9 do nothing, the 10th bans (from the log phase).
-for i in $(seq 9); do
-    [[ $(code 198.18.1.2 -d 'u=a&p=b' "$url/login") == 401 ]]
-done
-sleep 0.3
-refute listed 198.18.1.2
-[[ $(code 198.18.1.2 -d 'u=a&p=b' "$url/login") == 401 ]]
-wait_listed 198.18.1.2
 
 # Rate limit: a burst past 10 r/s + 20 gets 429s, then a ban.
 seen429=0
