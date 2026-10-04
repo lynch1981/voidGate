@@ -1032,5 +1032,121 @@ class Ja4Test(unittest.TestCase):
         self.assertIsNone(judge.ja4s)
 
 
+HONEY = r"^/(wp-login\.php|xmlrpc\.php|\.env|\.git(/|$))"
+
+
+class HoneyTest(unittest.TestCase):
+
+    def test_first_hit_bans_now(self):
+        # one probe among browsing; the ban is stamped with the probe's
+        # time, not the next step
+        lines = merge(browser("198.51.100.9", n=20),
+                      [line("203.0.113.7", T0 + 3.5, "/.env")])
+        act, out, judge = run(config(honey=[HONEY]), lines)
+
+        self.assertEqual(act.calls, [("203.0.113.7", 3600)])
+        self.assertIn("2026-10-03T10:00:03Z ban 203.0.113.7 ttl=3600"
+                      " offense=1", out)
+        self.assertIn("rule=honey path=/.env\n", out)
+        self.assertEqual(judge.honey_hits, 1)
+        # not counted in the window or the path report
+        self.assertNotIn("/.env", judge.paths)
+        self.assertNotIn(("203.0.113.7", 0), judge.win.totals)
+
+    def test_paths(self):
+        cfg = config(honey=[HONEY])
+        # /.envrc too: nobody serves it to visitors either
+        hits = ["/.env", "/.env.local", "/.envrc", "/.git", "/.git/config",
+                "/wp-login.php", "/xmlrpc.php?rsd"]
+        misses = ["/", "/.github/x", "/blog/wp-login.php",
+                  "/search?q=/.env"]
+
+        for path in hits + misses:
+            act, _, _ = run(cfg, [line("203.0.113.7", T0, path)])
+            self.assertEqual(len(act.calls), path in hits, path)
+
+    def test_one_ban_per_ttl(self):
+        lines = [line("203.0.113.7", T0 + i, p) for i, p in
+                 enumerate(["/.env", "/.git/config", "/wp-login.php"])]
+        act, _, judge = run(config(honey=[HONEY]), lines)
+        self.assertEqual(len(act.calls), 1)
+        self.assertEqual(judge.honey_hits, 3)
+
+    def test_escalates_and_caps(self):
+        # each probe after the last ban has ended
+        lines = [line("203.0.113.7", T0 + k * 20000, "/.env")
+                 for k in range(4)]
+        act, _, _ = run(config(honey=[HONEY], honey_ttl=3600,
+                               max_ttl=10000), lines)
+        self.assertEqual([t for _, t in act.calls],
+                         [3600, 7200, 10000, 10000])
+
+    def test_shares_offenses_with_rules(self):
+        # banned by the ratio rule first: a later probe is offense 2
+        lines = bot("203.0.113.7") + [line("203.0.113.7", T0 + 3600,
+                                           "/.env")]
+        act, out, _ = run(config(honey=[HONEY]), lines)
+        self.assertEqual(act.calls, [("203.0.113.7", 600),
+                                     ("203.0.113.7", 7200)])
+
+    def test_exempt(self):
+        dns = {"66.249.66.1": (["crawl.googlebot.com"], set()),
+               "crawl.googlebot.com": ([], {"66.249.66.1"})}
+        lines = [line("192.0.2.1", T0, "/.env"),
+                 line("127.0.0.1", T0, "/.env"),
+                 line("66.249.66.1", T0, "/.env"),
+                 line("-", T0, "/.env")]
+        act, _, judge = run(config(honey=[HONEY], allow=["192.0.2.0/24"],
+                                   crawler=["googlebot.com"]), lines,
+                            resolve=lambda n: dns.get(n, ([], set())))
+        self.assertEqual(act.calls, [])
+        self.assertEqual(judge.honey_hits, 4)
+
+    def test_wins_over_skip(self):
+        act, _, _ = run(config(honey=[HONEY], skip=["^/\\."]),
+                        [line("203.0.113.7", T0, "/.env")])
+        self.assertEqual(len(act.calls), 1)
+
+    def test_failed_ban_retried_by_next_probe(self):
+        act = Recorder(fail='"connect: No such file"')
+        lines = [line("203.0.113.7", T0 + i, "/.env") for i in range(3)]
+        _, out, _ = run(config(honey=[HONEY]), lines, act=act)
+        self.assertEqual(len(act.calls), 3)
+        self.assertEqual(out.count("error="), 3)
+
+    def test_review(self):
+        judge = logban.Judge(config(honey=[HONEY]), logban.dry_run,
+                             out=io.StringIO())
+        judge.history = []
+
+        for s in merge(bot("203.0.113.8"),
+                       [line("203.0.113.7", T0, "/.git/config")]):
+            judge.feed(s)
+
+        judge.finish()
+        rows = logban.summarize(judge.history)
+        self.assertEqual({r["ip"]: r["rules"] for r in rows},
+                         {"203.0.113.7": {"honey"},
+                          "203.0.113.8": {"ratio"}})
+
+    def test_config(self):
+        cfg = ConfigTest.load(self, "honey = %s\nhoney = ^/phpmyadmin\n"
+                                    "costly = x\n" % HONEY)
+        self.assertEqual(len(cfg.honey), 2)
+        self.assertEqual(cfg.honey_ttl, 3600)
+
+        for text in ("honey = .\n",               # matches /
+                     "honey = php|\n",            # matches the empty path
+                     "honey = ^/(\n",             # bad regex
+                     "honey = ^/x\nhoney_ttl = 0\n",
+                     "honey = ^/x\nhoney_ttl = 90000\n"):   # > max_ttl
+            with self.assertRaises(logban.ConfigError, msg=text):
+                ConfigTest.load(self, "costly = x\n" + text)
+
+        # honey_ttl is only checked when there are honey paths
+        cfg = ConfigTest.load(self, "costly = x\nmax_ttl = 600\n")
+        self.assertEqual(cfg.honey, [])
+
+
 if __name__ == "__main__":
     unittest.main()

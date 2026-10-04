@@ -14,6 +14,7 @@ Per address, over a 60 s sliding window judged every 10 s:
 |---|---|
 | `ratio` | at least 100 costly requests, and at least 90 % of all its requests |
 | `backend` | at least `max_backend_seconds` of backend time (off by default) |
+| `honey` | one request to a path the site never serves, banned at once |
 
 A request is costly if its path matches a `costly` regex, or its backend
 time is at least `slow_seconds`. A ban lasts 600 s and doubles for each
@@ -42,6 +43,13 @@ api_other.min_costly = 20
 
 JA4 picks thresholds, never a pass: fingerprints change with OS updates
 and can be copied ([design §5.5](../../doc/logban.md#55-ja4)).
+
+Honey paths catch scanners on their first probe:
+
+```
+honey = ^/(wp-login\.php|xmlrpc\.php|\.env|\.git(/|$))
+honey_ttl = 3600                 # doubles on repeats
+```
 
 ## Log format
 
@@ -89,7 +97,7 @@ One line per ban:
 ```
 
 `logban.conf` documents every key: thresholds, `costly`, `profile`,
-`skip`, `allow`, `allow_file`, `crawler`, ttl.
+`honey`, `skip`, `allow`, `allow_file`, `crawler`, ttl.
 
 ## Behind Cloudflare
 

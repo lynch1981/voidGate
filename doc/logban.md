@@ -75,14 +75,18 @@ refused.
  ┌─────────────────────▼──────────────────────────────────────────┐
  │ logban.py                                                      │
  │                                                                │
- │  parse_line ──▶ skip path? ──▶ path report (--top-paths)       │
+ │  parse_line ──▶ honey path? ──yes──▶ exempt? ──no──▶ ban now   │
+ │                     │ no                          (§5.6)       │
+ │                     ▼                                          │
+ │                 skip path? ──▶ path report (--top-paths)       │
  │                     │                                          │
  │                     ▼                                          │
  │           allowlisted address? ──yes──▶ not judged (§6.1)      │
  │                     │ no                                       │
  │                     ▼                                          │
- │  Window: per address [total, costly, backend s], 60 s / 10 s   │
- │                     │ every step                               │
+ │  profile: path / ua / ja4 (§5.4)                               │
+ │  Window: per (address, profile) [total, costly, backend s]     │
+ │                     │ every step (10 s, over 60 s)             │
  │                     ▼                                          │
  │  Judge: rule ratio | rule backend ──▶ crawler? (DNS, §6.3)      │
  │                     │                                          │
@@ -190,6 +194,7 @@ to see which paths cost the most backend time.
 |---|---|---|
 | `ratio` | `costly >= min_costly` (100) **and** `costly / total >= ratio` (0.9; `off` turns it off) | bots looping on costly URLs |
 | `backend` | backend seconds `>= max_backend_seconds` (0 = off) | a client heavy on the backend whatever it requests |
+| `honey` | one request to a `honey` path (§5.6) | scanners probing for `.env`, `.git`, admin panels |
 
 `min_costly` stops a short browsing burst from tripping the ratio. The
 ratio is what lets CGNAT and office addresses pass: many users behind
@@ -288,13 +293,53 @@ Blocking unknown fingerprints at request time belongs in nginx, not in
 logban or XDP: XDP would have to reassemble and parse TLS, and logban
 only sees a request after it was served.
 
+### 5.6 Honey paths
+
+A path the site never serves and no page links to: `/.env`, `/.git`,
+`/wp-login.php` on a site without WordPress. No real user asks for one,
+and scanners ask for all of them, so one request is enough:
+
+```
+honey = ^/(wp-login\.php|xmlrpc\.php|\.env|\.git(/|$))
+honey = ^/(phpmyadmin|pma|adminer)
+honey_ttl = 3600
+```
+
+- **Banned at once.** On the line itself, stamped with its time, not at
+  the next step. One ban per ttl however many probes follow.
+- **Matched on the path**, without the query string, like `costly` and
+  `skip`. Anchor with `^/`: `/blog/wp-login.php` is not a probe of the
+  root. Write `\.git(/|$)`, not `\.git/`, or `/.git` itself is missed,
+  and not `\.git`, or `/.github/...` is caught.
+- **Before `skip`**, so a broad `skip` cannot hide a probe. Not counted
+  in the window or the path report.
+- **Exempt as usual:** `allow`, `allow_file` and verified crawlers. A
+  CDN edge proxying a scanner is not banned (§8).
+- **`honey_ttl`** (3600 s) starts the ttl, then doubles per offense like
+  any ban, sharing the count with the other rules, up to `max_ttl`. The
+  OpenResty example bans a day at once; logban starts lower because one
+  infected phone behind a carrier's CGNAT address should not cut off
+  everyone behind it for a day on its first probe.
+- **Refused patterns.** A `honey` regex that matches `/` or an empty path
+  (a malformed request line) would ban every client: config error.
+- A failed ban is not retried on a timer. Scanners send many probes, and
+  the next one tries again.
+
+Do not list a path a real page links to, even a hidden link: browser
+prefetching, accessibility tools and mail link scanners follow links. A
+link meant as a trap must be `rel="nofollow"` and `Disallow`ed in
+`robots.txt`, so well-behaved crawlers stay out. Let nginx answer 404 for
+honey paths, so the app never serves them.
+
+## 6. Exemptions
+
 ## 6. Exemptions
 
 | Exemption | Checked | Matches |
 |---|---|---|
 | `allow` | every line (cached) | CIDRs; `127.0.0.0/8` and `::1` always |
 | `allow_file` | every line (cached) | CIDR files, re-read when replaced |
-| `skip` | every line | path regexes: those requests are not judged |
+| `skip` | every line | path regexes: those requests are not judged; a `honey` path is checked first |
 | `crawler` | only when a rule fires | reverse DNS suffix, confirmed forward |
 
 ### 6.1 Allowlists are applied as lines are read
@@ -464,8 +509,10 @@ stdout, one line per ban:
 2026-10-03T10:00:30Z ban 203.0.113.1 ttl=600 offense=1 total=150 costly=149 ratio=0.99 backend=178.8s rule=ratio
 ```
 
-The time is the end of the judged window, from the log's clock. A failed
-ban adds `error="..."`, quoting the daemon's reply or the socket error.
+The time is the end of the judged window, from the log's clock; for
+`rule=honey`, the probe's own time, followed by `path=<the probe>`. A
+failed ban adds `error="..."`, quoting the daemon's reply or the socket
+error.
 
 stderr:
 
@@ -474,7 +521,8 @@ stderr:
 | `allow_file reloaded: N networks` | an `allow_file` changed |
 | `allow_file not reloaded, keeping N networks: ...` | the change did not parse |
 | `skip <ip> crawler\|allow total=N costly=N` | with `-v`, a verified crawler, or an address allowlisted mid-window (§6.2), matched a rule |
-| `N lines, N unparsed, N allowed` | at the end of a replay, with `-v` or `--top-paths` |
+| `skip <ip> allow\|crawler honey <path>` | with `-v`, an exempt client hit a honey path |
+| `N lines, N unparsed, N allowed, N honey hits` | at the end of a replay, with `-v` or a `--top-*` report |
 
 `--review` prints its table and results on stdout instead of ban lines
 (§7.3).
@@ -566,6 +614,9 @@ The offense counts are kept for every address ever banned (§15).
 - **JA4 spoofing.** Same rule: a copied fingerprint picks thresholds,
   never a pass (§5.5). `--top-ja4` prints its profile lines commented
   out, so an attacker's fingerprint is never allowlisted by a paste.
+- **Honey paths and shared addresses.** One probe bans the address: a
+  CGNAT address with one infected device in it is banned too, for
+  `honey_ttl`. Keep it short, and never list a linked path (§5.6).
 - **A poisoned CDN list** could turn logban off for large ranges.
   `cdn_allow.py` fetches over HTTPS and refuses anything wider than `/8`
   or `/16` (§9).
@@ -576,6 +627,7 @@ The offense counts are kept for every address ever banned (§15).
 |---|---|
 | daemon down, or socket not reachable | each ban printed with `error=`, retried every step until it succeeds |
 | daemon refuses (address in `local_*` / `allow_*`, drop list full) | same: retried every step (§15) |
+| honey ban fails | printed with `error=`; the scanner's next probe tries again |
 | log rotated | follow reopens the new file; window and bans kept |
 | log deleted | follow waits for it to reappear |
 | `allow_file` missing or broken at startup | exit 1 with file and line |
@@ -606,6 +658,11 @@ The offense counts are kept for every address ever banned (§15).
   flooded `-v` output (§6.1).
 - **Checking crawlers as lines are read.** That is a DNS lookup per new
   address.
+- **Honey paths only in nginx** (the OpenResty example's `ban_now()`).
+  Faster, at the request itself, but it needs Lua. logban gives plain
+  nginx the same trap; with OpenResty, both can run.
+- **A hit count for honey paths** (ban on the 3rd). A real user never
+  sends even one, and scanners send dozens: one is enough.
 - **A hard JA4 allowlist** (block every other fingerprint). Blocks
   users after an OS update, behind a TLS-inspecting proxy, or on an
   uncommon Android build, and copied fingerprints pass it (§5.5).
@@ -671,6 +728,7 @@ no daemon, about one second.
 | `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked |
 | `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
 | `Ja4Test` | `ja4=` parsed, `-` / empty / missing as none, `ja4t=` ignored; exact fingerprints held as a set, other `ja4:` as regexes, exact means exact; known stacks pass while a script with the app's user agent and a plain-HTTP client are banned by `api_other`; a copied fingerprint banned by `app.backend`; `--top-ja4` columns, share, banned count, commented paste lines that load once uncommented; no `ja4=` in the log; off unless asked |
+| `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 

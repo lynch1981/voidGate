@@ -193,11 +193,12 @@ class Config:
         "slow_seconds": (float, 0.0),
         "max_backend_seconds": (float, 0.0),
         "ttl": (int, 600),
+        "honey_ttl": (int, 3600),
         "max_ttl": (int, 86400),
         "offense_memory": (int, 86400),
         "socket": (str, VG_SOCK_PATH),
     }
-    LISTS = ("costly", "skip", "allow", "allow_file", "crawler")
+    LISTS = ("costly", "skip", "honey", "allow", "allow_file", "crawler")
 
     def __init__(self):
         for key, (_, default) in self.SCALARS.items():
@@ -205,6 +206,7 @@ class Config:
 
         self.costly = []
         self.skip = []
+        self.honey = []
         self.allow = [ipaddress.ip_network("127.0.0.0/8"),
                       ipaddress.ip_network("::1/128")]
         self.allow_files = AllowFiles()
@@ -247,7 +249,7 @@ class Config:
         if key in self.SCALARS:
             setattr(self, key, self.SCALARS[key][0](value))
 
-        elif key in ("costly", "skip"):
+        elif key in ("costly", "skip", "honey"):
             getattr(self, key).append(re.compile(value))
 
         elif key == "allow":
@@ -292,6 +294,18 @@ class Config:
 
         if not 1 <= self.ttl <= self.max_ttl <= MAX_TTL:
             raise ConfigError("need 1 <= ttl <= max_ttl <= %d" % MAX_TTL)
+
+        if self.honey and not 1 <= self.honey_ttl <= self.max_ttl:
+            raise ConfigError("need 1 <= honey_ttl <= max_ttl")
+
+        # One hit bans: a pattern that matches the home page, or the empty
+        # path of a malformed request line, would ban everyone.
+        for rx in self.honey:
+            for path in ("/", ""):
+                if rx.search(path):
+                    raise ConfigError("honey %r matches %r"
+                                      % (rx.pattern, path or "an empty"
+                                         " path"))
 
         for name, sub, value in self.pending:
             p = self.profile(name)
@@ -459,6 +473,7 @@ class Judge:
         self.lines = 0
         self.skipped = 0
         self.unjudged = 0
+        self.honey_hits = 0
         self.history = None         # list: keep every ban (--review)
         self.peaks = None           # dict: per-client peaks (--top-clients)
         self.ja4s = None            # dict: per-JA4 totals (--top-ja4)
@@ -473,6 +488,12 @@ class Judge:
         ip, t, path, cost, ua, ja4 = r
         self.lines += 1
         self.clock(t)
+
+        # A path no real client asks for: ban on the first hit, now, not
+        # at the next step. Before skip, so skip cannot hide a probe.
+        if self.cfg.honey and any(rx.search(path) for rx in self.cfg.honey):
+            self.honey(ip, t, path)
+            return
 
         if any(p.search(path) for p in self.cfg.skip):
             return
@@ -608,21 +629,38 @@ class Judge:
 
             self.ban(ip, now, rule, total, costly, cost)
 
-    def ban(self, ip, now, rule, total, costly, cost):
+    def honey(self, ip, now, path):
+        self.honey_hits += 1
+
+        if self.banned.get(ip, 0) > now:
+            return
+
+        why = self.exempt_reason(ip)
+
+        if why:
+            if self.verbose:
+                self.log("skip %s %s honey %s" % (ip, why, path))
+            return
+
+        # A failed ban is retried by the scanner's next probe.
+        self.ban(ip, now, "honey", 1, 0, 0.0, base=self.cfg.honey_ttl,
+                 note=" path=" + path)
+
+    def ban(self, ip, now, rule, total, costly, cost, base=None, note=""):
         cfg = self.cfg
         count, last = self.offenses.get(ip, (0, 0))
 
         if now - last > cfg.offense_memory:
             count = 0
 
-        ttl = min(cfg.ttl << min(count, 30), cfg.max_ttl)
+        ttl = min((base or cfg.ttl) << min(count, 30), cfg.max_ttl)
         err = self.act(ip, ttl)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
 
         self.out.write("%s ban %s ttl=%d offense=%d total=%d costly=%d"
-                       " ratio=%.2f backend=%.1fs rule=%s%s\n"
+                       " ratio=%.2f backend=%.1fs rule=%s%s%s\n"
                        % (stamp, ip, ttl, count + 1, total, costly,
-                          costly / total, cost, rule,
+                          costly / total, cost, rule, note,
                           " error=" + err if err else ""))
         self.out.flush()
 
@@ -1142,9 +1180,10 @@ def main(argv=None):
 
     if args.verbose or args.top_paths or args.top_clients \
             or args.top_ja4:
-        sys.stderr.write("logban: %d lines, %d unparsed, %d allowed\n"
+        sys.stderr.write("logban: %d lines, %d unparsed, %d allowed,"
+                         " %d honey hits\n"
                          % (judge.lines + judge.skipped, judge.skipped,
-                            judge.unjudged))
+                            judge.unjudged, judge.honey_hits))
 
     if args.top_paths:
         judge.report_paths(args.top_paths)
