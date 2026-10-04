@@ -18,6 +18,15 @@ if [[ -z $nginx ]]; then
     exit 0
 fi
 
+# refute <cmd...>: fail if cmd succeeds. Not "! cmd": set -e ignores a
+# negated command, so "! grep ..." can never fail the script.
+refute() {
+    if "$@"; then
+        echo "${0##*/}: unexpectedly true: $*" >&2
+        return 1
+    fi
+}
+
 cleanup() {
     local result=$?
     trap - EXIT
@@ -83,6 +92,17 @@ http {
             }
         }
 
+        # ban_now() in the log phase: no cosocket there, so an error
+        # return (not a raised error that aborts the handler).
+        location = /ban_now_log {
+            content_by_lua_block { ngx.say("ok") }
+            log_by_lua_block {
+                local ok, err = require("resty.voidgate").ban_now(
+                    ngx.var.arg_ip, 60)
+                ngx.log(ngx.ERR, "ban_now from log: ", tostring(ok), " ", err)
+            }
+        }
+
         # ban() from the log phase, where cosockets are not allowed.
         location = /ban {
             content_by_lua_block { ngx.say("queued") }
@@ -133,8 +153,19 @@ for i in $(seq 30); do
 done
 grep -q '\] dropped [0-9]* prefix.*timed [1-9]' "$work/daemon.log"
 get '/ban?ip=1.2.3.4/24' > /dev/null
+get '/ban_now_log?ip=198.18.0.30' > /dev/null
 sleep 0.2
 grep -q 'ban: bad ip' "$prefix/error.log"
-! grep -q '\[alert\]\|\[crit\]' "$prefix/error.log"
+grep -q 'ban_now from log: nil no cosocket in this phase, use ban()' \
+    "$prefix/error.log"
+refute grep -q 'failed to run log_by_lua' "$prefix/error.log"
+drops=$("$root/voidgatectl" drops)
+refute grep -q '198.18.0.30/32' <<< "$drops"
+# The "missing socket" check in resty.lua makes nginx's core log a [crit]
+# connect() failure; anything else at crit or alert is a bug.
+grep '\[alert\]\|\[crit\]' "$prefix/error.log" \
+    | grep -v 'connect() to unix:/run/voidgate.sock.missing failed' \
+    > "$work/unexpected.log" || true
+[[ ! -s $work/unexpected.log ]] || { cat "$work/unexpected.log" >&2; exit 1; }
 
 echo "resty client tests passed"
