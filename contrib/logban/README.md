@@ -98,6 +98,9 @@ python3 logban.py -n -c logban.conf /var/log/nginx/access.log.*.gz
 # Replay, list the would-be bans, ban only the ones you pick.
 sudo python3 logban.py -r -c logban.conf /var/log/nginx/access.log
 
+# "Why was 203.0.113.7 banned?" (or why not): every judgment of it.
+python3 logban.py -c logban.conf -x 203.0.113.7 /var/log/nginx/access.log
+
 # Live and dry, then live and enforcing (root or ctl_socket_group).
 python3 logban.py -n -f -c logban.conf /var/log/nginx/access.log
 sudo python3 logban.py -f -c logban.conf /var/log/nginx/access.log

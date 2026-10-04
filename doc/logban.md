@@ -508,6 +508,48 @@ as is:
 - timed drops never count toward `aggregate_k`;
 - any live drop keeps the gate ACTIVE (l7-bridge §8).
 
+### 7.5 Explain
+
+`--explain IP` (`-x`) answers "why was this address banned", or "why
+not", from the logs: a replay as a dry run (nothing is sent, whatever
+the config's socket) that prints only that address.
+
+```
+explain 203.0.113.1: 60 s window, judged every 10 s; times are window ends, UTC
+2026-10-03 10:00:10  default      total=38 costly=37 backend=44.4s  under: costly 37 < min_costly 100
+2026-10-03 10:00:20  default      total=94 costly=93 backend=111.6s  under: costly 93 < min_costly 100
+2026-10-03 10:00:30  default      total=150 costly=149 backend=178.8s  fires ratio
+2026-10-03 10:00:30  BAN          rule=ratio ttl=600 offense=1, until 2026-10-03 10:10:30
+2026-10-03 10:10:20  banned       59 steps not shown: the replay keeps its requests, XDP would drop them
+2026-10-03 10:10:30  default      total=133 costly=129 backend=154.9s  fires ratio
+2026-10-03 10:10:30  BAN          rule=ratio ttl=1200 offense=2, until 2026-10-03 10:30:30
+
+summary: 2976 lines: judged default 2976; skipped 0; honey 0
+peak window, default: total 150, costly 149, backend 178.8 s
+bans: ratio at 2026-10-03 10:00:30, ttl 600, ratio at 2026-10-03 10:10:30, ttl 1200
+```
+
+- **One row per judgment step** in which the address has requests in
+  the window: per profile its counts and verdict, then per watch its
+  hits. A verdict is `fires <rule>`, `fires <rule>, exempt: <why>`, or
+  `under:` with the thresholds it missed (`costly 37 < min_costly 100`,
+  `costly share 0.83 < ratio 0.90`, `backend 12.0 s < 30.0 s`, `hits 40 <
+  max 50`, `hits share 0.10 < ratio 0.50`).
+- **Honey hits and bans** get rows of their own; the steps judged while
+  banned are folded into one `banned` row (§7.2).
+- **Never judged:** an allowlisted address gets one row saying so, and
+  the summary repeats it.
+- **The summary**: lines judged per profile, skipped and honey lines,
+  peak window per profile (outside bans), and every ban.
+- **Not in the log**: says so, with the two usual causes. The argument is
+  normalized (`2001:DB8:0::BAD` finds `2001:db8::bad`), but nginx logs an
+  IPv4 client of an `[::]` listener without `ipv6only` as
+  `::ffff:a.b.c.d`.
+
+The verdicts use the same rule tests as the judge (`Profile.rule`,
+`Watch.fires`), and a test checks that `--explain` reports the same bans
+as a normal run. With no `--explain`, it costs nothing.
+
 ## 8. Behind a CDN
 
 XDP sees the TCP peer, and the peer of a proxied request is the CDN's
@@ -809,6 +851,7 @@ integration scripts.
 | `Ja4Test` | `ja4=` parsed, `-` / empty / missing as none, `ja4t=` ignored; exact fingerprints held as a set, other `ja4:` as regexes, exact means exact; known stacks pass while a script with the app's user agent and a plain-HTTP client are banned by `api_other`; a copied fingerprint banned by `app.backend`; `--top-ja4` columns, share, banned count, commented paste lines that load once uncommented; no `ja4=` in the log; off unless asked |
 | `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; `throttled` on 429; OR lines and a status regex, `ttl`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
+| `ExplainTest` | under, fires and BAN rows with their times, folded banned steps, summary; the same bans as a normal run; `under:` reasons (costly share, backend); allowlisted: never judged; verified crawler: exempt; honey, skipped, two profiles and a watch in one replay; watch ratio reason; not in the log; CLI: IPv6 normalized, the config's socket never used, bad address, refused with `-f` and `--review` |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 

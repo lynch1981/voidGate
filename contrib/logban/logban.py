@@ -184,6 +184,40 @@ class Profile:
         return (values[2] in self.ja4
                 or any(rx.search(values[i]) for i, rx in self.match))
 
+    def rule(self, total, costly, cost):
+        """The rule this window's counts fire, or None."""
+
+        if self.ratio is not None and costly >= self.min_costly \
+                and costly >= self.ratio * total:
+            return self.prefix + "ratio"
+
+        if self.max_backend_seconds > 0 and cost >= self.max_backend_seconds:
+            return self.prefix + "backend"
+
+        return None
+
+    def under(self, total, costly, cost):
+        """Why no rule fires, for --explain."""
+
+        why = []
+
+        if self.ratio is None:
+            why.append("ratio off")
+
+        elif costly < self.min_costly:
+            why.append("costly %d < min_costly %d" % (costly,
+                                                       self.min_costly))
+
+        else:
+            why.append("costly share %.2f < ratio %.2f"
+                       % (costly / total, self.ratio))
+
+        if self.max_backend_seconds > 0:
+            why.append("backend %.1f s < %.1f s"
+                       % (cost, self.max_backend_seconds))
+
+        return "; ".join(why)
+
 
 class Watch:
     """Count the requests that match all of a line's conditions, per
@@ -225,6 +259,10 @@ class Watch:
         order = (F_STATUS, F_METHOD, F_PATH)
         conds.sort(key=lambda c: order.index(c[0]))
         self.alts.append(conds)
+
+    def fires(self, hits, total):
+        return hits >= self.max and (self.ratio is None
+                                     or hits >= self.ratio * total)
 
     def matches(self, r):
         """r: a parse_line() tuple. Plain loops: this runs per line and
@@ -572,6 +610,165 @@ class Window:
                 b.pop(key, None)
 
 
+def clock_str(t):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
+
+
+class Explain:
+    """--explain: every judgment of one address, with the thresholds it
+    was measured against, its honey hits and bans, then a summary."""
+
+    def __init__(self, ip, judge, out):
+        self.ip = ip
+        self.judge = judge
+        self.cfg = judge.cfg
+        self.out = out
+        self.lines = 0
+        self.skipped = 0
+        self.judged = collections.Counter()     # profile index -> lines
+        self.honeys = 0
+        self.why_listed = None
+        self.bans = []
+        self.peaks = {}                         # profile index -> counts
+        self.held = []                          # steps while banned
+        out.write("explain %s: %d s window, judged every %d s; times are"
+                  " window ends, UTC\n" % (ip, self.cfg.window,
+                                            self.cfg.step))
+
+    def row(self, t, what, text):
+        self.out.write("%s  %-12s %s\n" % (clock_str(t), what, text))
+
+    LISTED = {"allow": "allowlisted (allow or allow_file)",
+              "bad-address": "not an IP address"}
+
+    def listed(self, t, why):
+        if self.why_listed is None:
+            self.why_listed = why
+            self.row(t, "never judged", "%s: no rule, watch or ban applies"
+                     % self.LISTED.get(why, why))
+
+    def flush_held(self):
+        """One line for the steps judged while banned. In a replay the
+        client keeps sending; live, XDP drops it and they never come."""
+
+        if self.held:
+            self.row(self.held[-1], "banned", "%d steps not shown: the"
+                     " replay keeps its requests, XDP would drop them"
+                     % len(self.held))
+            self.held = []
+
+    def honey(self, t, path):
+        self.honeys += 1
+        self.flush_held()
+        self.row(t, "honey", path)
+
+    def ban(self, t, rule, ttl, offense, err):
+        self.flush_held()
+
+        if err:
+            self.row(t, "ban failed", "rule=%s ttl=%d error=%s"
+                     % (rule, ttl, err))
+            return
+
+        self.bans.append((t, rule, ttl))
+        self.row(t, "BAN", "rule=%s ttl=%d offense=%d, until %s"
+                 % (rule, ttl, offense, clock_str(t + ttl)))
+
+    def verdict(self, now, rule):
+        # step() returns early while the address is banned
+        why = self.judge.exempt_reason(self.ip)
+
+        if why:
+            return "fires %s, exempt: %s" % (rule, why)
+
+        return "fires %s" % rule
+
+    def step(self, now):
+        cfg = self.cfg
+        win = self.judge.win
+        all_req = 0
+
+        if self.judge.banned.get(self.ip, 0) > now:
+            if any((self.ip, i) in win.totals
+                   for i in range(len(cfg.profiles))):
+                self.held.append(now)
+            return
+
+        self.flush_held()
+
+        for pi, p in enumerate(cfg.profiles):
+            st = win.totals.get((self.ip, pi))
+
+            if st is None:
+                continue
+
+            total, costly, cost = st
+            all_req += total
+            pk = self.peaks.setdefault(pi, [0, 0, 0.0])
+            pk[:] = [max(pk[0], total), max(pk[1], costly),
+                     max(pk[2], cost)]
+            rule = p.rule(total, costly, cost)
+            self.row(now, p.name, "total=%d costly=%d backend=%.1fs  %s"
+                     % (total, costly, cost,
+                        self.verdict(now, rule) if rule
+                        else "under: " + p.under(total, costly, cost)))
+
+        for wi, w in enumerate(cfg.watches):
+            st = self.judge.watched.totals.get((self.ip, wi))
+
+            if st is None:
+                continue
+
+            hits = st[0]
+            total = all_req or hits
+
+            if w.fires(hits, total):
+                text = self.verdict(now, w.name)
+
+            elif hits < w.max:
+                text = "under: hits %d < max %d" % (hits, w.max)
+
+            else:
+                text = "under: hits share %.2f < ratio %.2f" % (
+                    hits / total, w.ratio)
+
+            self.row(now, "watch " + w.name, "hits=%d of %d  %s"
+                     % (hits, total, text))
+
+    def summary(self):
+        out = self.out
+        cfg = self.cfg
+        self.flush_held()
+
+        if not self.lines:
+            out.write("\n%s is not in the log. nginx writes IPv6 compressed"
+                      " and lowercase; behind [::] without ipv6only, IPv4"
+                      " clients are ::ffff:a.b.c.d.\n" % self.ip)
+            return
+
+        judged = ", ".join("%s %d" % (cfg.profiles[pi].name, n)
+                           for pi, n in sorted(self.judged.items()))
+        out.write("\nsummary: %d lines: judged %s; skipped %d; honey %d"
+                  % (self.lines, judged or "0", self.skipped, self.honeys))
+
+        if self.why_listed:
+            out.write("; never judged: %s" % self.why_listed)
+
+        out.write("\n")
+
+        for pi, (total, costly, cost) in sorted(self.peaks.items()):
+            out.write("peak window, %s: total %d, costly %d, backend %.1f s"
+                      "\n" % (cfg.profiles[pi].name, total, costly, cost))
+
+        if self.bans:
+            out.write("bans: %s\n" % ", ".join(
+                "%s at %s, ttl %d" % (rule, clock_str(t), ttl)
+                for t, rule, ttl in self.bans))
+
+        else:
+            out.write("bans: none\n")
+
+
 class Judge:
 
     def __init__(self, cfg, act, out=sys.stdout, verbose=0,
@@ -597,6 +794,7 @@ class Judge:
         self.history = None         # list: keep every ban (--review)
         self.peaks = None           # dict: per-client peaks (--top-clients)
         self.ja4s = None            # dict: per-JA4 totals (--top-ja4)
+        self.explain = None         # Explain: one address (--explain)
 
     def feed(self, line):
         r = parse_line(line)
@@ -608,6 +806,10 @@ class Judge:
         ip, t, path, cost, ua, ja4, _, _ = r
         self.lines += 1
         self.clock(t)
+        x = self.explain if self.explain and ip == self.explain.ip else None
+
+        if x:
+            x.lines += 1
 
         # A path no real client asks for: ban on the first hit, now, not
         # at the next step. Before skip, so skip cannot hide a probe.
@@ -616,6 +818,8 @@ class Judge:
             return
 
         if any(p.search(path) for p in self.cfg.skip):
+            if x:
+                x.skipped += 1
             return
 
         if cost is not None:
@@ -633,6 +837,9 @@ class Judge:
         # the path report above, but out of the window.
         if self.listed_reason(ip):
             self.unjudged += 1
+
+            if x:
+                x.listed(t, self.listed_reason(ip))
             return
 
         costly = (any(p.search(path) for p in self.cfg.costly)
@@ -642,6 +849,9 @@ class Judge:
         key = (ip, self.profile_of((path, ua, ja4))
                    if len(self.cfg.profiles) > 1 else 0)
         self.win.add(key, int(costly), cost or 0.0)
+
+        if x:
+            x.judged[key[1]] += 1
 
         if self.cfg.watches:
             for i, w in enumerate(self.cfg.watches):
@@ -723,6 +933,9 @@ class Judge:
         if cfg.allow_files.refresh():
             self.listed.clear()
 
+        if self.explain:
+            self.explain.step(now)
+
         for key, (total, costly, cost) in list(self.win.totals.items()):
             ip, pi = key
             p = cfg.profiles[pi]
@@ -733,15 +946,9 @@ class Judge:
                 pk[1] = max(pk[1], total)
                 pk[2] = max(pk[2], costly)
 
-            if p.ratio is not None and costly >= p.min_costly \
-                    and costly >= p.ratio * total:
-                rule = p.prefix + "ratio"
+            rule = p.rule(total, costly, cost)
 
-            elif p.max_backend_seconds > 0 \
-                    and cost >= p.max_backend_seconds:
-                rule = p.prefix + "backend"
-
-            else:
+            if rule is None:
                 continue
 
             if self.banned.get(ip, 0) > now:
@@ -779,7 +986,7 @@ class Judge:
 
             total = totals[ip] or hits
 
-            if w.ratio is not None and hits < w.ratio * total:
+            if not w.fires(hits, total):
                 continue
 
             if self.banned.get(ip, 0) > now:
@@ -798,6 +1005,10 @@ class Judge:
 
     def honey(self, ip, now, path):
         self.honey_hits += 1
+        x = self.explain if self.explain and ip == self.explain.ip else None
+
+        if x:
+            x.honey(now, path)
 
         if self.banned.get(ip, 0) > now:
             return
@@ -825,6 +1036,9 @@ class Judge:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
 
         held = isinstance(err, Refused)
+
+        if self.explain and ip == self.explain.ip:
+            self.explain.ban(now, rule, ttl, count + 1, err)
 
         self.out.write("%s ban %s ttl=%d offense=%d total=%d costly=%d"
                        " ratio=%.2f backend=%.1fs rule=%s%s%s%s\n"
@@ -1295,6 +1509,9 @@ def main(argv=None):
                     help="follow one log like tail -F")
     ap.add_argument("-r", "--review", action="store_true",
                     help="replay, list the bans, ban only those you pick")
+    ap.add_argument("-x", "--explain", metavar="IP",
+                    help="replay as a dry run and show why IP was, or was"
+                         " not, banned")
     ap.add_argument("--from-start", action="store_true",
                     help="with -f, read the existing file first")
     ap.add_argument("--top-paths", type=int, metavar="N", default=0,
@@ -1323,7 +1540,25 @@ def main(argv=None):
 
     act = dry_run if args.dry_run else ctl_drop(cfg.socket)
 
-    if args.review:
+    if args.explain:
+        try:
+            args.explain = str(ipaddress.ip_address(args.explain))
+
+        except ValueError:
+            sys.stderr.write("logban: --explain: not an address: %s\n"
+                             % args.explain)
+            return 1
+
+        if args.follow or args.review:
+            sys.stderr.write("logban: --explain replays logs, not with -f"
+                             " or --review\n")
+            return 1
+
+        judge = Judge(cfg, dry_run, out=open(os.devnull, "w"),
+                      verbose=args.verbose)
+        judge.explain = Explain(args.explain, judge, sys.stdout)
+
+    elif args.review:
         if args.follow:
             sys.stderr.write("logban: --review replays logs, not -f\n")
             return 1
@@ -1380,6 +1615,9 @@ def main(argv=None):
 
     if args.top_ja4:
         judge.report_ja4(args.top_ja4)
+
+    if args.explain:
+        judge.explain.summary()
 
     if args.review:
         try:

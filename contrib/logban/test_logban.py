@@ -10,6 +10,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -1358,6 +1359,151 @@ class WatchTest(unittest.TestCase):
                      "scan.ratio = 2\n"):
             with self.assertRaises(logban.ConfigError, msg=text):
                 ConfigTest.load(self, "costly = x\n" + text)
+
+
+class ExplainTest(unittest.TestCase):
+
+    def explain(self, ip, lines, cfg=None, resolve=None):
+        cfg = cfg or config()
+        out = io.StringIO()
+        act = Recorder()
+        judge = logban.Judge(cfg, act, out=io.StringIO(), resolve=resolve)
+        judge.explain = logban.Explain(ip, judge, out)
+
+        for s in lines:
+            judge.feed(s)
+
+        judge.finish()
+        judge.explain.summary()
+        return out.getvalue(), judge
+
+    def test_bot(self):
+        text, _ = self.explain("203.0.113.7", merge(
+            bot("203.0.113.7", n=1500), browser("198.51.100.9")))
+        rows = text.splitlines()
+
+        self.assertIn("explain 203.0.113.7: 60 s window, judged every 10 s",
+                      rows[0])
+        self.assertIn("10:00:10  default      total=50 costly=50"
+                      " backend=0.0s  under: costly 50 < min_costly 100",
+                      rows[1])
+        self.assertIn("10:00:20  default      total=100 costly=100", rows[2])
+        self.assertTrue(rows[2].endswith("fires ratio"))
+        self.assertIn("10:00:20  BAN          rule=ratio ttl=600 offense=1,"
+                      " until 2026-10-03 10:10:20", rows[3])
+        # the replay keeps sending while banned: one line, not 59
+        self.assertRegex(rows[4], r"banned +\d+ steps not shown")
+        self.assertIn("bans: ratio at 2026-10-03 10:00:20, ttl 600", text)
+        # nothing about the browser
+        self.assertNotIn("198.51.100.9", text)
+
+    def test_matches_a_normal_run(self):
+        lines = merge(bot("203.0.113.7", n=3000), bot("203.0.113.8"),
+                      browser("198.51.100.9"))
+        act, out, _ = run(config(), lines)
+        _, judge = self.explain("203.0.113.7", lines)
+        normal = [l for l in out.splitlines() if " 203.0.113.7 " in l]
+        self.assertEqual(len(judge.explain.bans), len(normal))
+
+        for (t, rule, ttl), l in zip(judge.explain.bans, normal):
+            self.assertIn("ban 203.0.113.7 ttl=%d " % ttl, l)
+            self.assertIn("rule=" + rule, l)
+            self.assertTrue(l.startswith(time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))))
+
+    def test_under_reasons(self):
+        # 150 costly + 30 cheap: enough costly, too small a share
+        lines = merge(bot("203.0.113.7", n=150),
+                      bot("203.0.113.7", n=30, path="/", start=T0 + 0.1))
+        text, _ = self.explain("203.0.113.7", lines,
+                               config(max_backend_seconds=500))
+        self.assertIn("under: costly share 0.83 < ratio 0.90;"
+                      " backend 0.0 s < 500.0 s", text)
+        self.assertIn("bans: none", text)
+
+    def test_never_judged(self):
+        text, _ = self.explain("192.0.2.1", bot("192.0.2.1"),
+                               config(allow=["192.0.2.0/24"]))
+        self.assertEqual(text.count("never judged"), 2)    # row, summary
+        self.assertIn("allowlisted (allow or allow_file): no rule", text)
+        self.assertIn("judged 0;", text)
+
+    def test_crawler(self):
+        dns = {"66.249.66.1": (["crawl.googlebot.com"], set()),
+               "crawl.googlebot.com": ([], {"66.249.66.1"})}
+        text, _ = self.explain("66.249.66.1", bot("66.249.66.1"),
+                               config(crawler=["googlebot.com"]),
+                               resolve=lambda n: dns.get(n, ([], set())))
+        self.assertIn("fires ratio, exempt: crawler", text)
+        self.assertIn("bans: none", text)
+
+    def test_honey_skip_profiles_watches(self):
+        cfg = watch_config(*SCAN, "scan.ratio = 0.5", "honey = ^/\\.env",
+                           "skip = ^/static/", "profile api = path:^/api/",
+                           "api.max_backend_seconds = 100")
+        lines = merge(hits("203.0.113.7", 40, status=404, every=0.25),
+                      hits("203.0.113.7", 40, path="/api/x", every=0.25),
+                      hits("203.0.113.7", 5, path="/static/a.css"),
+                      [line("203.0.113.7", T0 + 25, "/.env")])
+        text, _ = self.explain("203.0.113.7", lines, cfg)
+
+        self.assertIn("default      total=40 costly=0", text)
+        self.assertIn("api          total=40 costly=0", text)
+        self.assertIn("watch scan   hits=40 of 80  under: hits 40 < max 50",
+                      text)
+        self.assertIn("honey        /.env", text)
+        self.assertIn("BAN          rule=honey ttl=3600", text)
+        self.assertIn("judged default 40, api 40; skipped 5; honey 1", text)
+
+    def test_watch_ratio(self):
+        cfg = watch_config(*SCAN, "scan.ratio = 0.5")
+        lines = merge(hits("100.64.0.1", 60, status=404),
+                      hits("100.64.0.1", 540, path="/", every=0.05))
+        text, _ = self.explain("100.64.0.1", lines, cfg)
+        self.assertRegex(text, r"watch scan +hits=\d+ of \d+  under: hits"
+                               r" share 0\.\d\d < ratio 0\.50")
+
+    def test_not_in_log(self):
+        text, _ = self.explain("9.9.9.9", bot("203.0.113.7", n=5))
+        self.assertIn("9.9.9.9 is not in the log", text)
+
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        saved = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+
+        try:
+            code = logban.main(list(argv))
+
+        finally:
+            sys.stdout, sys.stderr = saved
+
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cli(self):
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "access.log")
+        conf = os.path.join(d, "logban.conf")
+
+        with open(log, "w") as f:
+            f.writelines(bot("2001:db8::bad"))
+
+        with open(conf, "w") as f:
+            # a socket that does not exist: --explain must not use it
+            f.write("costly = ^/search\nsocket = %s/none.sock\n" % d)
+
+        code, out, _ = self.main("-c", conf, "-x", "2001:DB8:0::BAD", log)
+        self.assertEqual(code, 0)
+        self.assertIn("explain 2001:db8::bad:", out)
+        self.assertIn("BAN          rule=ratio", out)
+        self.assertNotIn("error", out)
+
+        for argv, msg in ((["-x", "300.1.1.1"], "not an address"),
+                          (["-x", "::1", "-f"], "not with -f"),
+                          (["-x", "::1", "-r"], "not with -f or --review")):
+            code, _, err = self.main("-c", conf, *argv, log)
+            self.assertEqual(code, 1)
+            self.assertIn(msg, err)
 
 
 if __name__ == "__main__":
