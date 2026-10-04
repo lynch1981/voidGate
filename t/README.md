@@ -88,12 +88,11 @@ Everything test-related lives under `t/`. `prove -r t/` only picks up
 | `bin/create_env.sh` | private namespaces + `test0`/`peer0` veth; sourced by `bin/run` and `integration/*.sh` |
 | `bin/reindex` | renumbers `=== TEST N:` blocks, normalizes spacing |
 | `conf/xdp.conf` | daemon fixture for the `*.t` suite |
-| `conf/idle.conf` | never-wake fixture for `integration/daemon.sh`, `resty.sh` and `example.sh` |
+| `conf/idle.conf` | never-wake fixture for `integration/daemon.sh` and `resty.sh` |
 | `unit/policy.c` | control-plane unit test, built as `t/unit/policy` by `make` (no root) |
 | `unit/cidr.c` | CIDR parser and config CIDR lists, built as `t/unit/cidr` (no root) |
 | `integration/daemon.sh` | daemon startup, detach, logging, pid file |
 | `integration/resty.sh` | OpenResty client in real nginx (`resty.lua` methods, `ban()`, `ctl_socket_group`); skips without nginx + lua module |
-| `integration/example.sh` | `contrib/openresty/nginx.conf` as shipped, with a python3 stub backend: honeypot, 429s, status page; skips without nginx + lua module |
 | `integration/netns.sh` | veth flood: IDLE → ACTIVE wake and drop |
 | `bench/` | manual load generators (`hping3`, `pktgen`) from a netns; not tests |
 
@@ -103,7 +102,6 @@ scripts run separately, each with sudo:
 ```sh
 sudo t/integration/daemon.sh
 sudo t/integration/resty.sh
-sudo t/integration/example.sh
 sudo t/integration/netns.sh
 ```
 

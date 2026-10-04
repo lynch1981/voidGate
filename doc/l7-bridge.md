@@ -385,7 +385,8 @@ each pattern in its phase: a health timer started in `init_worker_by_lua*`
 and a local status page using the methods in `content_by_lua*`. It listens
 on 8080, which a master started as an ordinary user can bind, sets
 `error_log ... error` explicitly (§7.2), and notes each duration next to
-its literal (`600, -- 10m`). `t/integration/example.sh` runs it as shipped.
+its literal (`600, -- 10m`). No test runs it: it is an example to copy and
+adapt, while `resty.sh` covers the client it calls.
 
 **Install.** `make install-lua` copies the file to
 `/usr/local/openresty/site/lualib/resty/`. For Kong or APISIX, set
@@ -521,11 +522,9 @@ For anyone upgrading:
 | `t/drop-ttl-xdp.t` | a timed drop really drops at XDP; SSH still passes |
 | `t/integration/daemon.sh` | `ctl_socket_group` chown, kept on reload, unknown group only warns; `voidgatectl` exits 1 on error |
 | `t/integration/resty.sh` + `resty.lua` | real nginx with workers as `nobody:nogroup`: every method against a real daemon, ttl required and validated, reload; `ban_now()` answers and local rejects; `ban()` from the log phase, 50 requests send exactly one ban; `ban_now()` from the log phase returns an error instead of aborting the handler |
-| `t/integration/example.sh` | `contrib/openresty/nginx.conf` as shipped, at its own `error_log` level: every honeypot path banned at once, a lookalike (`/.github`) left alone, a refused protected address logged, a 429 burst bans, the status page lists the drops; with voidgate stopped, the honeypot still answers 403 and logs the failed ban once |
 
 Negative checks in the shell tests use a `refute` helper: under `set -e`,
 `! cmd` never fails the script, so `! grep ...` would check nothing.
 
-`resty.sh` and `example.sh` need OpenResty, or nginx with `lua-nginx-module`
-(Ubuntu: `nginx-core libnginx-mod-http-lua`), and skip otherwise;
-`example.sh` also needs python3 for its stub backend.
+`resty.sh` needs OpenResty, or nginx with `lua-nginx-module`
+(Ubuntu: `nginx-core libnginx-mod-http-lua`), and skips otherwise.

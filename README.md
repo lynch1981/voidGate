@@ -91,7 +91,7 @@ or APISIX, decide which client is abusive (`limit_req`, failed logins, bot
 rules) and push that address down to XDP with a timed drop. The design and
 its trade-offs are in [`doc/l7-bridge.md`](doc/l7-bridge.md).
 
-A complete, tested OpenResty config is in
+A complete OpenResty config is in
 [`contrib/openresty/nginx.conf`](contrib/openresty/nginx.conf): the shared
 dict, a honeypot path banned with `ban_now()` in the access phase,
 `limit_req` 429s banned with `ban()` in the log phase, a health timer, and
@@ -232,15 +232,12 @@ support, curl, and OpenResty or nginx with `lua-nginx-module`; on Ubuntu,
 
 ```sh
 sudo t/integration/resty.sh
-sudo t/integration/example.sh    # contrib/openresty/nginx.conf; also python3
 ```
 
 `resty.sh` runs nginx in private namespaces with workers as
 `nobody:nogroup`, the method tests in `t/integration/resty.lua`, and `ban()`
-from the log phase. `example.sh` runs the shipped example config as is, with
-a stub backend, and checks each of its bans.
-Both skip when neither `openresty` nor `nginx` is in `PATH`; set `NGINX` to
-choose the binary.
+from the log phase. It skips when neither `openresty` nor `nginx` is in
+`PATH`; set `NGINX` to choose the binary.
 
 ## How it decides
 
