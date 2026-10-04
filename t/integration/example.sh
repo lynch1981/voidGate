@@ -107,7 +107,7 @@ render() {
 } > "$prefix/nginx.conf"
 
 render '"/usr/local/openresty/site/lualib/?.lua;;"' "\"$work/lua/?.lua;;\""
-render 'listen 80;' 'listen 127.0.0.1:8081;'
+render 'listen 8080;' 'listen 127.0.0.1:8080;'
 render '# set_real_ip_from 10.0.0.0/8;' 'set_real_ip_from 127.0.0.1;'
 render '# real_ip_header   X-Forwarded-For;' 'real_ip_header X-Forwarded-For;'
 
@@ -135,7 +135,7 @@ wait_listed() {
     return 1
 }
 
-url=http://127.0.0.1:8081
+url=http://127.0.0.1:8080
 
 for i in $(seq 50); do
     curl -s -o /dev/null "$url/voidgate/status" && break
