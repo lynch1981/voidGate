@@ -184,6 +184,14 @@ to see which paths cost the most backend time.
 ratio is what lets CGNAT and office addresses pass: many users behind
 one address send many costly requests, but also many cheap ones.
 
+`max_backend_seconds` reads best as workers: backend seconds in one
+window divided by the window is how many backend workers the client keeps
+busy on average. `30` in a 60 s window is half a worker. Choose it from
+`--top-clients` (§10) on a normal week of logs, not by guessing. A CGNAT
+address carries many users' backend time, so it is the first legitimate
+client this rule hits; in the synthetic log of §11 it peaks at 146 s,
+ten times any single browser.
+
 ## 6. Exemptions
 
 | Exemption | Checked | Matches |
@@ -378,6 +386,27 @@ stderr:
 `--top-paths N` then prints the N paths with the most backend seconds,
 or the most requests when the log has no timing fields.
 
+`--top-clients N` prints the N clients with the highest **peak** backend
+seconds in one window, with that peak as workers, its requests and costly
+requests, all their requests in the log, and whether this run banned
+them. Then percentiles of the peaks over the clients that were not
+banned:
+
+```
+  #  address       backend_s  workers requests   costly   all_req  banned
+  1  203.0.113.6       406.9     6.78      344      339      2979  yes
+ 16  100.64.0.1        146.0     2.43      694      112     35982
+ 17  198.51.1.184       14.8     0.25       32       12        69
+
+peak backend s per window, 3001 clients not banned: p50 6.4  p90 8.8  p99 11.2  p99.9 13.6  max 146.0
+```
+
+Peaks are sampled at each judgment step. Allowlisted addresses are not
+judged, so they are not listed. In a replay a banned client keeps
+sending (§7.2), so its peak can be higher than at its ban. Without timing
+fields both are by requests. Both reports are printed at the end of a
+replay; a follow run does not end, so it prints neither.
+
 ## 11. Performance
 
 One core, CPython 3.12, synthetic log of one hour: 339k lines from 3000
@@ -495,6 +524,7 @@ no daemon, about one second.
 | `AllowFileTest` | allowlisted addresses kept out of the window but in the path report, one allowlist check per address; missing or broken file at startup; reload on replace; broken update keeps the old list; counts made before the reload excused |
 | `SocketTest` | the exact `drop <ip> ttl=N` sent; `ok`, a refusal, no daemon |
 | `FollowTest` | follow across a rename rotation, counts kept |
+| `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 

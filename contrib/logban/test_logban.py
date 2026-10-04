@@ -236,7 +236,7 @@ class JudgeTest(unittest.TestCase):
                                         urt="0.5"))
         out = io.StringIO()
         judge.out = out
-        judge.report(5)
+        judge.report_paths(5)
         self.assertIn("/search", out.getvalue())
         self.assertIn("200", out.getvalue())
 
@@ -350,6 +350,9 @@ class FollowTest(unittest.TestCase):
 class AllowFileTest(unittest.TestCase):
 
     def setUp(self):
+        # reload warnings are expected here
+        self.stderr, sys.stderr = sys.stderr, io.StringIO()
+        self.addCleanup(setattr, sys, "stderr", self.stderr)
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "cdn.txt")
         self.put("# cloudflare\n173.245.48.0/20\n\n2606:4700::/32  # v6\n")
@@ -672,6 +675,64 @@ class ReviewTest(unittest.TestCase):
             sys.stderr = saved
 
         self.assertIn("--review", err.getvalue())
+
+
+class TopClientsTest(unittest.TestCase):
+
+    def report(self, lines, n=10, **kw):
+        out = io.StringIO()
+        judge = logban.Judge(config(**kw), Recorder(), out=out)
+        judge.peaks = {}
+
+        for s in lines:
+            judge.feed(s)
+
+        judge.finish()
+        judge.report_clients(n)
+        return judge, out.getvalue()
+
+    def test_peaks(self):
+        # 100 x 0.5 s in 20 s, then 20 x 0.5 s a minute later
+        lines = (bot("198.51.100.1", n=100, path="/x", rt="0.6", urt="0.5")
+                 + bot("198.51.100.1", n=20, path="/x", rt="0.6",
+                       urt="0.5", start=T0 + 120)
+                 + bot("198.51.100.2", n=10, path="/x", rt="1", urt="1"))
+        judge, out = self.report(sorted(lines,
+                                        key=lambda s: logban.parse_line(s)[1]))
+
+        self.assertEqual(judge.peaks["198.51.100.1"], [50.0, 100, 0, 120])
+        self.assertEqual(judge.peaks["198.51.100.2"], [10.0, 10, 0, 10])
+        rows = out.splitlines()
+        self.assertIn("peak backend seconds", rows[1])
+        self.assertRegex(rows[3], r"^  1  198\.51\.100\.1 +50\.0 +0\.83 +100 ")
+        self.assertIn("2 clients not banned: p50 10.0  p90 50.0", out)
+
+    def test_banned_flagged_not_in_percentiles(self):
+        lines = merge(bot("203.0.113.7", rt="0.5", urt="0.5"),
+                      bot("198.51.100.1", n=40, path="/", rt="0.1",
+                          urt="0.1"))
+        _, out = self.report(lines)
+        self.assertRegex(out, r"203\.0\.113\.7 .* yes\n")
+        self.assertIn("1 clients not banned: p50 4.0", out)
+
+    def test_allowlisted_not_shown(self):
+        lines = merge(bot("192.0.2.1", rt="1", urt="1"),
+                      bot("198.51.100.1", n=5, rt="1", urt="1"))
+        judge, out = self.report(lines, allow=["192.0.2.0/24"])
+        self.assertEqual(set(judge.peaks), {"198.51.100.1"})
+        self.assertNotIn("192.0.2.1", out)
+
+    def test_no_timing(self):
+        lines = merge(bot("198.51.100.1", n=30), bot("198.51.100.2", n=60))
+        _, out = self.report(lines, n=1)
+        self.assertIn("peak requests", out)
+        self.assertIn("198.51.100.2", out)
+        self.assertNotIn("198.51.100.1 ", out)
+        self.assertIn("(no rt=/urt=", out)
+
+    def test_off_by_default(self):
+        _, _, judge = run(config(), bot("198.51.100.1", n=5))
+        self.assertIsNone(judge.peaks)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ The first field must be the TCP peer: with the realip module on, log
 # Which paths cost the backend most? Write the costly regexes from it.
 python3 logban.py -n --top-paths 20 -c logban.conf /var/log/nginx/access.log
 
+# Each client's peak backend seconds per window, with percentiles:
+# choose max_backend_seconds from these.
+python3 logban.py -n --top-clients 20 -c logban.conf /var/log/nginx/access.log
+
 # Replay old logs (gzip works): print what would have been banned.
 python3 logban.py -n -c logban.conf /var/log/nginx/access.log.*.gz
 

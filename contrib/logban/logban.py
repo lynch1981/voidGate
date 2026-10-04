@@ -25,6 +25,7 @@ import argparse
 import collections
 import gzip
 import ipaddress
+import math
 import os
 import re
 import signal
@@ -343,6 +344,7 @@ class Judge:
         self.skipped = 0
         self.unjudged = 0
         self.history = None         # list: keep every ban (--review)
+        self.peaks = None           # dict: per-client peaks (--top-clients)
 
     def feed(self, line):
         r = parse_line(line)
@@ -380,6 +382,15 @@ class Judge:
                       and cost >= self.cfg.slow_seconds))
 
         self.win.add(ip, int(costly), cost or 0.0)
+
+        if self.peaks is not None:
+            pk = self.peaks.get(ip)
+
+            if pk is None:
+                # peak backend s, peak requests, peak costly, all requests
+                pk = self.peaks[ip] = [0.0, 0, 0, 0]
+
+            pk[3] += 1
 
     def clock(self, t):
         """Move the window to time t. A late line (nginx logs a request
@@ -421,6 +432,12 @@ class Judge:
             self.listed.clear()
 
         for ip, (total, costly, cost) in list(self.win.totals.items()):
+            if self.peaks is not None:
+                pk = self.peaks[ip]
+                pk[0] = max(pk[0], cost)
+                pk[1] = max(pk[1], total)
+                pk[2] = max(pk[2], costly)
+
             if costly >= cfg.min_costly and costly >= cfg.ratio * total:
                 rule = "ratio"
 
@@ -537,7 +554,7 @@ class Judge:
 
         return False
 
-    def report(self, n):
+    def report_paths(self, n):
         """Print the paths that cost the backend most (or the most
         requested ones when the log has no timing)."""
 
@@ -553,6 +570,50 @@ class Judge:
 
         if not self.timed:
             self.out.write("(no rt=/urt= in the log: sorted by requests)\n")
+
+    def report_clients(self, n):
+        """Print the clients with the highest peak backend seconds in one
+        window, and percentiles over those this run did not ban: the
+        numbers to choose max_backend_seconds from."""
+
+        col = 0 if self.timed else 1
+        rows = sorted(self.peaks.items(), key=lambda kv: (-kv[1][col], kv[0]))
+        out = self.out
+
+        out.write("\nclients by peak %s in one %d s window"
+                  " (allowlisted addresses are not judged, so not shown)\n"
+                  % ("backend seconds" if self.timed else "requests",
+                     self.cfg.window))
+
+        if rows:
+            width = max(len(ip) for ip, _ in rows[:n])
+            out.write("%3s  %-*s %10s %8s %8s %8s %9s  %s\n"
+                      % ("#", width, "address", "backend_s", "workers",
+                         "requests", "costly", "all_req", "banned"))
+
+        for i, (ip, pk) in enumerate(rows[:n], 1):
+            out.write("%3d  %-*s %10.1f %8.2f %8d %8d %9d  %s\n"
+                      % (i, width, ip, pk[0], pk[0] / self.cfg.window,
+                         pk[1], pk[2], pk[3],
+                         "yes" if ip in self.offenses else ""))
+
+        kept = sorted(pk[col] for ip, pk in rows if ip not in self.offenses)
+
+        if not kept:
+            return
+
+        def rank(q):
+            # nearest rank
+            return kept[max(0, math.ceil(len(kept) * q / 100) - 1)]
+
+        out.write("\npeak %s per window, %d clients not banned:"
+                  " p50 %s  p90 %s  p99 %s  p99.9 %s  max %s\n"
+                  % ("backend s" if self.timed else "requests", len(kept),
+                     *("%.1f" % rank(q) for q in (50, 90, 99, 99.9, 100))))
+
+        if not self.timed:
+            out.write("(no rt=/urt= in the log: requests, not backend"
+                      " seconds)\n")
 
     def log(self, msg):
         warn(msg)
@@ -821,6 +882,9 @@ def main(argv=None):
                     help="with -f, read the existing file first")
     ap.add_argument("--top-paths", type=int, metavar="N", default=0,
                     help="at the end, print the N costliest paths")
+    ap.add_argument("--top-clients", type=int, metavar="N", default=0,
+                    help="at the end, print the N clients with the highest"
+                         " peak backend seconds, and percentiles")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(argv)
 
@@ -852,6 +916,9 @@ def main(argv=None):
     else:
         judge = Judge(cfg, act, verbose=args.verbose)
 
+    if args.top_clients:
+        judge.peaks = {}
+
     if args.follow:
         if len(args.logs) != 1 or args.logs[0] == "-":
             sys.stderr.write("logban: -f takes one log file\n")
@@ -875,13 +942,16 @@ def main(argv=None):
 
     judge.finish()
 
-    if args.verbose or args.top_paths:
+    if args.verbose or args.top_paths or args.top_clients:
         sys.stderr.write("logban: %d lines, %d unparsed, %d allowed\n"
                          % (judge.lines + judge.skipped, judge.skipped,
                             judge.unjudged))
 
     if args.top_paths:
-        judge.report(args.top_paths)
+        judge.report_paths(args.top_paths)
+
+    if args.top_clients:
+        judge.report_clients(args.top_clients)
 
     if args.review:
         try:
