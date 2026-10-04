@@ -1017,6 +1017,8 @@ Future work:
 
 `python3 contrib/logban/test_logban.py`, also run by `make test`. No root,
 no daemon, about 5 s, most of it `DataTest` replaying the real log.
+`DocTest` fails when this document misses a new option, key or test
+class: update it with the code.
 
 `sudo t/integration/logban.sh` runs logban against a real daemon in
 private namespaces, about 10 s. Not part of `make test`, like the other
@@ -1042,6 +1044,7 @@ integration scripts.
 | `TimeTest` | the `time_local` fast path equals `strptime` (also checked on 20,000 random stamps and offsets while writing it); out-of-range and misshapen stamps rejected |
 | `DataTest` | replays of `data/` (§17): with `data/me.conf`, 261 addresses banned, all by honey, no Cloudflare edge, no address that loaded the game, over 70 % of requests dropped, `80.94.95.211` banned before its `.git` downloads; without the Cloudflare allowlist, over 100 edges banned; the generated JSON sample parses whole and bans nothing |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
+| `DocTest` | this document keeps up with the code: every command-line option, config key and test class appears in it, every `§` reference and `#` link has its heading, and every config example (§5.4 to §5.8) loads. A self-check feeds it a broken copy and expects each gap reported, and requires at least five examples, so a broken checker cannot pass. |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
 | `t/integration/logban.sh` | Covers |

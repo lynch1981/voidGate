@@ -2031,5 +2031,142 @@ class CrawlerTest(unittest.TestCase):
                 ConfigTest.load(self, "costly = x\n" + text)
 
 
+DOC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                   "doc", "logban.md")
+
+
+def doc_examples(doc):
+    """The config examples in the doc: plain ``` blocks of key = value
+    lines, comments dropped."""
+
+    blocks, cur, lang = [], None, None
+
+    for ln in doc.splitlines():
+        m = re.match(r"^\s*```(\w*)\s*$", ln)
+
+        if m and cur is None:
+            cur, lang = [], m.group(1)
+
+        elif m:
+            blocks.append((lang, cur))
+            cur = None
+
+        elif cur is not None:
+            cur.append(ln)
+
+    examples = []
+
+    for lang, block in blocks:
+        lines = [ln.split("#")[0].strip() for ln in block
+                 if not ln.lstrip().startswith("#")]
+        lines = [ln for ln in lines if ln]
+
+        # not nginx or shell, not the ttl formula of section 7.1
+        if lang or not lines or lines[0].startswith("ttl = min("):
+            continue
+
+        if all(re.match(r"^[a-z_]+(\s+[a-z0-9_]+)?(\.[a-z_]+)?\s*=\s", ln)
+               for ln in lines):
+            examples.append(lines)
+
+    return examples
+
+
+def doc_problems(doc, src, tests):
+    """What doc/logban.md misses of logban.py and this file: options,
+    config keys, test classes, section references and anchors."""
+
+    problems = []
+
+    for opts in re.findall(r'add_argument\("(-[-\w]*)"(?:, "(--[-\w]+)")?',
+                           src):
+        problems += ["option " + o for o in opts if o and "`" + o not in doc]
+
+    for key in (list(logban.Config.SCALARS) + list(logban.Config.LISTS)
+                + list(logban.Profile.KEYS) + list(logban.Watch.KEYS)):
+        if "`" + key not in doc and "." + key + "`" not in doc:
+            problems.append("key " + key)
+
+    for cls in re.findall(r"^class (\w+Test)\(", tests, re.M):
+        if "| `%s` |" % cls not in doc:
+            problems.append("test class " + cls)
+
+    heads = re.findall(r"^#{2,3} (\d+(?:\.\d+)?)\.? ", doc, re.M)
+    problems += ["section ref " + r
+                 for r in sorted(set(re.findall(r"§(\d+(?:\.\d+)?)", doc)))
+                 if r not in heads]
+
+    anchors = {re.sub(r"[^\w\- ]", "", h.lower()).replace(" ", "-")
+               for h in re.findall(r"^#{2,3} (.+)$", doc, re.M)}
+    problems += ["anchor " + a for a in re.findall(r"\]\(#([^)]+)\)", doc)
+                 if a not in anchors]
+
+    return problems
+
+
+class DocTest(unittest.TestCase):
+    """doc/logban.md keeps up with the code: a new option, key or test
+    class fails here until it is documented."""
+
+    def setUp(self):
+        if not os.path.exists(DOC):
+            self.skipTest("no doc/logban.md")
+
+        with open(DOC) as f:
+            self.doc = f.read()
+
+        with open(logban.__file__) as f:
+            self.src = f.read()
+
+        with open(os.path.abspath(__file__)) as f:
+            self.tests = f.read()
+
+    def test_documented(self):
+        self.assertEqual(doc_problems(self.doc, self.src, self.tests), [])
+
+    def test_examples_load(self):
+        examples = doc_examples(self.doc)
+        # sections 5.4 to 5.8 each have one: fewer means the block
+        # parser broke, not that the doc got better
+        self.assertGreaterEqual(len(examples), 5)
+
+        for lines in examples:
+            with tempfile.NamedTemporaryFile("w", suffix=".conf",
+                                             delete=False) as f:
+                f.write("costly = x\n" + "\n".join(lines) + "\n")
+
+            try:
+                logban.Config().load(f.name)
+
+            except logban.ConfigError as e:
+                self.fail("example %r: %s" % (lines[0], e))
+
+            finally:
+                os.unlink(f.name)
+
+    def test_checker_catches(self):
+        # the checker itself: each kind of gap is reported
+        broken = (self.doc.replace("`honey_ttl`", "honey ttl")
+                  .replace("| `DataTest` |", "| DataTest |")
+                  .replace("`--top-ja4", "--top-ja4")
+                  + "\nsee §99, and [x](#no-such-heading)\n")
+        self.assertEqual(sorted(doc_problems(broken, self.src, self.tests)),
+                         ["anchor no-such-heading", "key honey_ttl",
+                          "option --top-ja4", "section ref 99",
+                          "test class DataTest"])
+
+        bad = "```\nwatch scan = status:404\n```\n"
+        lines, = doc_examples(bad)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".conf",
+                                         delete=False) as f:
+            f.write("costly = x\n" + "\n".join(lines) + "\n")
+
+        with self.assertRaises(logban.ConfigError):
+            logban.Config().load(f.name)
+
+        os.unlink(f.name)
+
+
 if __name__ == "__main__":
     unittest.main()
