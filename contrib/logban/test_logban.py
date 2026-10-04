@@ -923,6 +923,7 @@ class ProfileTest(unittest.TestCase):
 IOS = "t13d2014h2_a09f3c656075_14788d8d241b"
 OKHTTP = "t13d1516h2_8daaf6152771_02713d6af862"
 REQUESTS = "t13d1812h1_85036bcba153_b26ce05bbdd6"
+CHROME_JA4 = "t13d1517h2_8daaf6152771_b1ff8ab2d16f"
 
 
 def ja4_config():
@@ -1504,6 +1505,160 @@ class ExplainTest(unittest.TestCase):
             code, _, err = self.main("-c", conf, *argv, log)
             self.assertEqual(code, 1)
             self.assertIn(msg, err)
+
+
+BOT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/129.0"
+
+
+def cluster_config(*extra):
+    return watch_config("costly = ^/api/", "cluster_min_addresses = 10",
+                        "cluster_min_costly = 100", *extra)
+
+
+def botnet(n=30, per=10, start=T0, ua=BOT_UA, ja4=REQUESTS, path="/search",
+           net="203.0.113.%d"):
+    """n addresses, each sending per costly requests over 50 s: far
+    under any per-address threshold."""
+
+    return merge(*[[line(net % (k + 1), start + i * 50 / per + k * 0.01,
+                         path, ua=ua, ja4=ja4) for i in range(per)]
+                   for k in range(n)])
+
+
+class ClusterTest(unittest.TestCase):
+
+    def test_wide_botnet(self):
+        lines = botnet()
+
+        act, _, _ = run(config(), lines)
+        self.assertEqual(act.calls, [], "per-address rules see nothing")
+
+        act, out, _ = run(cluster_config(), lines)
+        self.assertEqual(sorted(ip for ip, _ in act.calls),
+                         sorted("203.0.113.%d" % (k + 1) for k in range(30)))
+        self.assertIn('rule=cluster cluster=30 ja4=%s ua="%s"\n'
+                      % (REQUESTS, BOT_UA), out)
+
+    def test_ua_alone(self):
+        # no ja4= in the log: the user agent is the fingerprint
+        lines = [ln.replace(" ja4=" + REQUESTS, "") for ln in botnet()]
+        act, out, _ = run(cluster_config(), lines)
+        self.assertEqual(len(act.calls), 30)
+        self.assertIn('rule=cluster cluster=30 ua="', out)
+        self.assertNotIn("ja4=", out)
+
+    def test_browsers_share_a_fingerprint(self):
+        # 50 real browsers on one stack: plenty of costly requests, but
+        # mostly cheap pages and assets
+        lines = merge(*[[line("198.51.100.%d" % (k + 1), T0 + i + k * 0.01,
+                              "/search" if i % 4 == 0 else "/", ua=BOT_UA,
+                              ja4=CHROME_JA4) for i in range(40)]
+                        for k in range(50)])
+        act, _, judge = run(cluster_config(), lines)
+        self.assertEqual(act.calls, [])
+
+    def test_search_only_users_in_a_browser_cluster(self):
+        # 50 browsing normally, 5 who only ran a few searches: each of
+        # the 5 looks like a bot alone, the cluster shows they are not
+        lines = merge(*[[line("198.51.100.%d" % (k + 1), T0 + i + k * 0.01,
+                              "/search" if i % 4 == 0 else "/", ua=BOT_UA,
+                              ja4=CHROME_JA4) for i in range(40)]
+                        for k in range(50)],
+                      *[[line("198.51.101.%d" % (k + 1), T0 + i * 5,
+                              "/search", ua=BOT_UA, ja4=CHROME_JA4)
+                         for i in range(4)] for k in range(5)])
+        act, _, _ = run(cluster_config(), lines)
+        self.assertEqual(act.calls, [])
+
+    def test_members_must_behave_like_bots(self):
+        lines = merge(
+            botnet(),
+            # shares the fingerprint, browses normally
+            [line("192.0.2.200", T0 + i, "/search" if i % 3 == 0 else "/",
+                  ua=BOT_UA, ja4=REQUESTS) for i in range(30)],
+            # shares it, two costly requests only
+            [line("192.0.2.201", T0 + i, "/search", ua=BOT_UA, ja4=REQUESTS)
+             for i in range(2)])
+        act, _, _ = run(cluster_config(), lines)
+        banned = {ip for ip, _ in act.calls}
+        self.assertEqual(len(banned), 30)
+        self.assertNotIn("192.0.2.200", banned)
+        self.assertNotIn("192.0.2.201", banned)
+
+    def test_thresholds(self):
+        # 9 addresses, or 99 costly requests: no cluster
+        act, _, _ = run(cluster_config(), botnet(n=9, per=20))
+        self.assertEqual(act.calls, [])
+        act, _, _ = run(cluster_config(), botnet(n=11, per=9))
+        self.assertEqual(act.calls, [])
+        # the same 300 requests spread over 10 minutes: no window holds
+        lines = merge(*[[line("203.0.113.%d" % (k + 1), T0 + i * 60 + k,
+                              "/search", ua=BOT_UA, ja4=REQUESTS)
+                         for i in range(10)] for k in range(30)])
+        act, _, _ = run(cluster_config(), lines)
+        self.assertEqual(act.calls, [])
+
+    def test_ratio_off_profiles_left_out(self):
+        # an app's users: all costly by design, one fingerprint
+        cfg = cluster_config("profile app = ua:^MyShop/", "app.ratio = off",
+                             "app.max_backend_seconds = 100")
+        lines = botnet(ua=APP, ja4=IOS, path="/api/search")
+        act, _, judge = run(cfg, lines)
+        self.assertEqual(act.calls, [])
+        self.assertEqual(judge.clusters.totals, {})
+
+    def test_exempt(self):
+        # allowlisted members never counted; verified crawlers not banned
+        lines = botnet(net="192.0.2.%d")
+        act, _, judge = run(cluster_config("allow = 192.0.2.0/24"), lines)
+        self.assertEqual((act.calls, judge.clusters.totals), ([], {}))
+
+        def dns(n):
+            if n.startswith("66.249.66."):
+                return ["crawl-%s.googlebot.com" % n], set()
+
+            if n.endswith(".googlebot.com"):
+                return [], {n[6:-14]}
+
+            return [], set()
+
+        lines = botnet(net="66.249.66.%d", ua="Googlebot/2.1")
+        act, _, _ = run(cluster_config("crawler = googlebot.com"), lines,
+                        resolve=dns)
+        self.assertEqual(act.calls, [])
+
+    def test_off_by_default(self):
+        _, _, judge = run(config(), botnet())
+        self.assertIsNone(judge.clusters)
+
+    def test_explain(self):
+        lines = merge(botnet(), [line("192.0.2.200", T0 + i,
+                                      "/search" if i % 3 == 0 else "/",
+                                      ua=BOT_UA, ja4=REQUESTS)
+                                 for i in range(30)])
+        text, _ = ExplainTest.explain(self, "192.0.2.200", lines,
+                                      cluster_config())
+        self.assertRegex(text, r"cluster +addresses=31 costly=\d+/\d+, its"
+                               r" \d+/\d+  under: its costly share 0\.\d+ <"
+                               r" cluster_ratio 0\.90")
+
+        text, _ = ExplainTest.explain(self, "203.0.113.1", lines,
+                                      cluster_config())
+        self.assertIn("under: cluster costly", text)
+        self.assertRegex(text, r"cluster +addresses=31 .*  fires cluster\n")
+        self.assertIn("BAN          rule=cluster", text)
+
+    def test_config(self):
+        for text in ("cluster_min_addresses = 1\n",
+                     "cluster_min_addresses = 5\ncluster_ratio = 0\n",
+                     "cluster_min_addresses = 5\ncluster_ratio = 1.5\n",
+                     "cluster_min_addresses = 5\ncluster_min_costly = 0\n",
+                     "cluster_min_addresses = 5\ncluster_member_min = 0\n"):
+            with self.assertRaises(logban.ConfigError, msg=text):
+                ConfigTest.load(self, "costly = x\n" + text)
+
+        # bounds are only checked when clusters are on
+        ConfigTest.load(self, "costly = x\ncluster_ratio = 5\n")
 
 
 if __name__ == "__main__":

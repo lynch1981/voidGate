@@ -293,6 +293,10 @@ class Config:
         "honey_ttl": (int, 3600),
         "max_ttl": (int, 86400),
         "offense_memory": (int, 86400),
+        "cluster_min_addresses": (int, 0),
+        "cluster_min_costly": (int, 300),
+        "cluster_ratio": (float, 0.9),
+        "cluster_member_min": (int, 3),
         "socket": (str, VG_SOCK_PATH),
     }
     LISTS = ("costly", "skip", "honey", "allow", "allow_file", "crawler")
@@ -417,6 +421,18 @@ class Config:
 
         if not 1 <= self.ttl <= self.max_ttl <= MAX_TTL:
             raise ConfigError("need 1 <= ttl <= max_ttl <= %d" % MAX_TTL)
+
+        if self.cluster_min_addresses:
+            if self.cluster_min_addresses < 2:
+                raise ConfigError("cluster_min_addresses is 0 (off) or at"
+                                  " least 2")
+
+            if not 0 < self.cluster_ratio <= 1:
+                raise ConfigError("cluster_ratio must be in (0, 1]")
+
+            if self.cluster_min_costly < 1 or self.cluster_member_min < 1:
+                raise ConfigError("cluster_min_costly and cluster_member_min"
+                                  " must be at least 1")
 
         if self.honey and not 1 <= self.honey_ttl <= self.max_ttl:
             raise ConfigError("need 1 <= honey_ttl <= max_ttl")
@@ -610,6 +626,39 @@ class Window:
                 b.pop(key, None)
 
 
+def cluster_under(cfg, addresses, total, costly):
+    """Why a fingerprint cluster does not fire, or "" when it does."""
+
+    if addresses < cfg.cluster_min_addresses:
+        return "addresses %d < cluster_min_addresses %d" % (
+            addresses, cfg.cluster_min_addresses)
+
+    if costly < cfg.cluster_min_costly:
+        return "cluster costly %d < cluster_min_costly %d" % (
+            costly, cfg.cluster_min_costly)
+
+    if costly < cfg.cluster_ratio * total:
+        return "cluster costly share %.2f < cluster_ratio %.2f" % (
+            costly / total, cfg.cluster_ratio)
+
+    return ""
+
+
+def member_under(cfg, total, costly):
+    """Why an address in a firing cluster is not banned, or "". A real
+    user who shares the bots' fingerprint also loads cheap pages."""
+
+    if costly < cfg.cluster_member_min:
+        return "its costly %d < cluster_member_min %d" % (
+            costly, cfg.cluster_member_min)
+
+    if costly < cfg.cluster_ratio * total:
+        return "its costly share %.2f < cluster_ratio %.2f" % (
+            costly / total, cfg.cluster_ratio)
+
+    return ""
+
+
 def clock_str(t):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
 
@@ -735,6 +784,21 @@ class Explain:
             self.row(now, "watch " + w.name, "hits=%d of %d  %s"
                      % (hits, total, text))
 
+        if self.judge.clusters is not None:
+            for (ja4, ua, ip), (total, costly, _) in \
+                    self.judge.clusters.totals.items():
+                if ip != self.ip:
+                    continue
+
+                n, ctotal, ccostly = self.judge.cluster_agg[(ja4, ua)]
+                why = (cluster_under(cfg, n, ctotal, ccostly)
+                       or member_under(cfg, total, costly))
+                self.row(now, "cluster", "addresses=%d costly=%d/%d, its"
+                         " %d/%d  %s"
+                         % (n, ccostly, ctotal, costly, total,
+                            "under: " + why if why
+                            else self.verdict(now, "cluster")))
+
     def summary(self):
         out = self.out
         cfg = self.cfg
@@ -781,6 +845,11 @@ class Judge:
         self.win = Window(cfg.step, cfg.window // cfg.step)
         # (address, watch) -> [hits, 0, 0], moved with self.win
         self.watched = Window(cfg.step, cfg.window // cfg.step)
+        # (ja4, user agent, address) -> [total, costly, backend s], for
+        # the profiles with the ratio rule on; None when clusters are off
+        self.clusters = (Window(cfg.step, cfg.window // cfg.step)
+                         if cfg.cluster_min_addresses else None)
+        self.cluster_agg = {}       # (ja4, ua) -> [addresses, total, costly]
         self.banned = {}            # ip -> until
         self.offenses = {}          # ip -> (count, last)
         self.listed = {}            # ip -> "allow", "bad-address" or ""
@@ -850,6 +919,12 @@ class Judge:
                    if len(self.cfg.profiles) > 1 else 0)
         self.win.add(key, int(costly), cost or 0.0)
 
+        # An app's API profile has ratio off: its users, all costly by
+        # design, must not form a cluster.
+        if self.clusters is not None \
+                and self.cfg.profiles[key[1]].ratio is not None:
+            self.clusters.add((ja4, ua, ip), int(costly), cost or 0.0)
+
         if x:
             x.judged[key[1]] += 1
 
@@ -902,6 +977,9 @@ class Judge:
             win.cur = idx
             win.reset()
             self.watched.reset()
+
+            if self.clusters is not None:
+                self.clusters.reset()
             return
 
         if idx <= win.cur:
@@ -912,6 +990,9 @@ class Judge:
             self.judge((win.cur + 1) * self.cfg.step)
             win.reset()
             self.watched.reset()
+
+            if self.clusters is not None:
+                self.clusters.reset()
             win.cur = idx
             return
 
@@ -920,6 +1001,9 @@ class Judge:
             self.judge(win.cur * self.cfg.step)
             win.push()
             self.watched.push()
+
+            if self.clusters is not None:
+                self.clusters.push()
 
     def finish(self):
         """Judge the partial window at end of input."""
@@ -932,6 +1016,20 @@ class Judge:
 
         if cfg.allow_files.refresh():
             self.listed.clear()
+
+        if self.clusters is not None:
+            agg = self.cluster_agg = {}
+
+            for (ja4, ua, _), (total, costly, _) in \
+                    self.clusters.totals.items():
+                a = agg.get((ja4, ua))
+
+                if a is None:
+                    a = agg[(ja4, ua)] = [0, 0, 0]
+
+                a[0] += 1
+                a[1] += total
+                a[2] += costly
 
         if self.explain:
             self.explain.step(now)
@@ -966,6 +1064,42 @@ class Judge:
 
         if self.watched.totals:
             self.judge_watches(now)
+
+        if self.cluster_agg:
+            self.judge_clusters(now)
+
+    def judge_clusters(self, now):
+        """Many addresses, each under every per-address threshold, with
+        one fingerprint and nearly only costly requests: a wide, slow
+        botnet. Ban the members that behave like it."""
+
+        cfg = self.cfg
+        hot = {k: a for k, a in self.cluster_agg.items()
+               if not cluster_under(cfg, *a)}
+
+        if not hot:
+            return
+
+        for (ja4, ua, ip), (total, costly, cost) in \
+                list(self.clusters.totals.items()):
+            a = hot.get((ja4, ua))
+
+            if a is None or member_under(cfg, total, costly):
+                continue
+
+            if self.banned.get(ip, 0) > now:
+                continue
+
+            why = self.exempt_reason(ip)
+
+            if why:
+                if self.verbose:
+                    self.log("skip %s %s cluster" % (ip, why))
+                continue
+
+            self.ban(ip, now, "cluster", total, costly, cost,
+                     note=' cluster=%d%s ua="%s"'
+                     % (a[0], " ja4=" + ja4 if ja4 else "", ua[:60]))
 
     def judge_watches(self, now):
         cfg = self.cfg

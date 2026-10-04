@@ -50,6 +50,9 @@ In scope:
   the existing `drop <ip> ttl=<sec>` (l7-bridge §4).
 - **Watches**: per-address counts of requests by method, path and status
   (404 scans, failed logins, `limit_req` 429s), §5.7.
+- **Fingerprint clusters**: many addresses, each under every threshold,
+  sharing one JA4 and user agent and sending nearly only costly
+  requests, §5.8.
 - **Profiles** by path, user agent or JA4 TLS fingerprint, each with its
   own thresholds (§5.4, §5.5).
 - **Replay**, to tune thresholds on old logs, **review**, to ban only
@@ -89,9 +92,10 @@ refused.
  │  profile: path / ua / ja4 (§5.4)                               │
  │  Window: per (address, profile) [total, costly, backend s]     │
  │  and per (address, watch) [hits] (§5.7)                        │
+ │  and per (ja4, ua, address) [total, costly] (§5.8)             │
  │                     │ every step (10 s, over 60 s)             │
  │                     ▼                                          │
- │  Judge: ratio | backend | watch ──▶ crawler? (DNS, §6.3)        │
+ │  Judge: ratio | backend | watch | cluster ──▶ crawler? (§6.3)  │
  │                     │                                          │
  │                     ▼                                          │
  │  ban: ttl × 2^offense ──▶ stdout line ──▶ socket (unless -n)   │
@@ -200,6 +204,7 @@ to see which paths cost the most backend time.
 | `backend` | backend seconds `>= max_backend_seconds` (0 = off) | a client heavy on the backend whatever it requests |
 | `honey` | one request to a `honey` path (§5.6) | scanners probing for `.env`, `.git`, admin panels |
 | a watch's name | `<name>.max` requests matching the watch, and optionally `<name>.ratio` of the address's requests (§5.7) | path scans, failed logins, clients nginx is already throttling |
+| `cluster` | its fingerprint cluster fires, and it behaves like the cluster (§5.8) | wide, slow botnets: each address under every threshold |
 
 `min_costly` stops a short browsing burst from tripping the ratio. The
 ratio is what lets CGNAT and office addresses pass: many users behind
@@ -386,6 +391,57 @@ Notes for the three examples:
 
 A watch has no profile or JA4 condition: add one if a case needs it.
 
+### 5.8 Fingerprint clusters
+
+Every rule above is per address. A botnet of 300 addresses, each sending
+12 searches a minute, stays under all of them: in a synthetic test,
+none of the 300 was banned. What gives it away is that its members look
+alike and do one thing: they share a TLS stack and user agent, and
+nearly all of their requests are costly.
+
+```
+cluster_min_addresses = 10      # 0 (default) is off
+cluster_min_costly = 300        # costly requests of the whole cluster
+cluster_ratio = 0.9             # costly share, of the cluster and of a member
+cluster_member_min = 3          # costly requests of one member
+```
+
+A **cluster** is every address sending one (JA4, user agent) pair, or
+one user agent when the log has no `ja4=`. It **fires** when, in one
+window, it has at least `cluster_min_addresses` addresses, at least
+`cluster_min_costly` costly requests, and a costly share of at least
+`cluster_ratio`. Then each **member** with at least `cluster_member_min`
+costly requests and its own costly share of at least `cluster_ratio` is
+banned, `rule=cluster cluster=<addresses> ja4=... ua="..."`.
+
+Each condition keeps someone safe:
+
+| Condition | Keeps safe |
+|---|---|
+| cluster costly share | browsers: thousands of real users share Chrome's fingerprint, but load pages and assets, so their cluster's share stays low, and the few among them who only searched are not banned for it |
+| member costly share | a real user who happens to share the bots' fingerprint, but browses |
+| `cluster_member_min` | an address that sent one or two requests on that fingerprint |
+| `cluster_min_addresses` | a single client: per-address rules handle it |
+| only profiles with `ratio` on | an app's users: all costly by design (§5.4), one fingerprint; they would form a cluster at once |
+
+Allowlisted addresses are not counted, verified crawlers are not banned,
+and `--explain` shows a row per cluster the address is in, with the
+reason it was or was not banned.
+
+The test above, with clusters on (126k lines: 1000 browsers on one
+Chrome fingerprint, 200 app users, the botnet copying Chrome's user agent
+but not its TLS stack, and one real user on the bots' stack):
+
+| | Banned |
+|---|---|
+| botnet, 300 addresses | all, 290 within 40 s of the cluster crossing its threshold |
+| browsers, app users, the real user (its share: 0.23) | none |
+
+**Limits.** A botnet that copies a common browser's TLS stack too
+(`curl-impersonate`) joins the real users' cluster, whose share is low,
+and passes. Real users of an uncommon stack who only hit costly paths
+look like a botnet; keep `ttl` short.
+
 ## 6. Exemptions
 
 | Exemption | Checked | Matches |
@@ -531,7 +587,8 @@ bans: ratio at 2026-10-03 10:00:30, ttl 600, ratio at 2026-10-03 10:10:30, ttl 1
 
 - **One row per judgment step** in which the address has requests in
   the window: per profile its counts and verdict, then per watch its
-  hits. A verdict is `fires <rule>`, `fires <rule>, exempt: <why>`, or
+  hits, then per fingerprint cluster its size, costly share and the
+  address's own. A verdict is `fires <rule>`, `fires <rule>, exempt: <why>`, or
   `under:` with the thresholds it missed (`costly 37 < min_costly 100`,
   `costly share 0.83 < ratio 0.90`, `backend 12.0 s < 30.0 s`, `hits 40 <
   max 50`, `hits share 0.10 < ratio 0.50`).
@@ -696,6 +753,8 @@ browsers, a CGNAT address and 15 bots.
 | one `ua:` profile (§5.4) | about 20 % more: a regex on every line |
 | no watches | no cost |
 | three watches (§5.7) | about 15 % more |
+| clusters off | no cost |
+| clusters on (§5.8) | about 18 % more |
 | `--top-clients` | about 30 % more: peaks updated every step |
 | a log without `ja4=` | no cost: the field is searched only when present |
 
@@ -778,6 +837,12 @@ The offense counts are kept for every address ever banned (§15).
   shares logban's window, allowlists, crawler check, refusal handling and
   offense count, and needs no second daemon; l7-bridge §14 has why
   fail2ban was not a decider.
+- **Clusters by network prefix** (many bans in one /24). Botnets rent
+  residential proxies spread over the internet, and CGNAT puts real
+  users in one prefix; voidGate already refuses to aggregate timed
+  drops for that reason (l7-bridge §5.4).
+- **Clusters by user agent alone** when JA4 is logged. The user agent is
+  one header a script sets to Chrome's; the TLS stack it rarely changes.
 - **Separate rules per case** (`scan_404 = 50`, `login_fail = 20`).
   Every site's login path and failure status differ; one generic shape
   covers them, and the next case, without code.
@@ -810,9 +875,10 @@ The offense counts are kept for every address ever banned (§15).
 
 Limits:
 
-- **Slow, wide botnets.** Many addresses each below `min_costly` per
-  window pass. That needs a global signal: `limit_req` on the endpoint,
-  or a challenge page.
+- **Slow, wide botnets that impersonate a browser.** Clusters (§5.8)
+  catch a botnet with its own fingerprint. One that copies a common
+  browser's TLS stack and user agent hides among real users; that needs
+  a global signal: `limit_req` on the endpoint, or a challenge page.
 - **Delay.** Up to one `step` after the threshold, plus log buffering.
 - **Clients behind a CDN** cannot be banned at XDP (§8).
 
@@ -852,12 +918,13 @@ integration scripts.
 | `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; `throttled` on 429; OR lines and a status regex, `ttl`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ExplainTest` | under, fires and BAN rows with their times, folded banned steps, summary; the same bans as a normal run; `under:` reasons (costly share, backend); allowlisted: never judged; verified crawler: exempt; honey, skipped, two profiles and a watch in one replay; watch ratio reason; not in the log; CLI: IPv6 normalized, the config's socket never used, bad address, refused with `-f` and `--review` |
+| `ClusterTest` | a 30-address botnet each under every threshold: no ban by per-address rules, all banned by the cluster, ban line with size, ja4 and ua; user agent alone without `ja4=`; 50 browsers on one stack pass; search-only users inside a browser cluster pass; a member that browses and one with 2 costly requests pass; below `cluster_min_addresses`, below `cluster_min_costly`, spread over 10 minutes; ratio-off profiles not clustered; allowlisted not counted, verified crawlers not banned; off by default; `--explain` rows; config bounds only when on. Each of the three safety conditions was removed in turn and a test failed. |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
 | `t/integration/logban.sh` | Covers |
 |---|---|
-| replay | ratio bans (IPv4 and IPv6), a honey ban and a `scan` watch ban land as `reason=4` drops; a browser is not dropped; a flood from the protected `local_networks` address is asked once (one logban line with `retry_after=600s`, one `refuse drop` line in the daemon log), not every step |
+| replay | ratio bans (IPv4 and IPv6), a honey ban, a `scan` watch ban and a 12-address cluster land as `reason=4` drops; a browser is not dropped; a flood from the protected `local_networks` address is asked once (one logban line with `retry_after=600s`, one `refuse drop` line in the daemon log), not every step |
 | follow | daemon stopped: a live flood's ban fails with `error=` and is retried every step; daemon started: the next retry lands the drop |
 
 That XDP then drops the address is `t/drop-ttl-xdp.t`'s job: logban sends

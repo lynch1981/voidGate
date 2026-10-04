@@ -16,6 +16,7 @@ Per address, over a 60 s sliding window judged every 10 s:
 | `backend` | at least `max_backend_seconds` of backend time (off by default) |
 | `honey` | one request to a path the site never serves, banned at once |
 | a watch | requests by method, path and status: 404 scans, failed logins, 429s |
+| `cluster` | many addresses on one JA4 + user agent, nearly all costly: a wide, slow botnet (off by default, `cluster_min_addresses = 10`) |
 
 A request is costly if its path matches a `costly` regex, or its backend
 time is at least `slow_seconds`. A ban lasts 600 s and doubles for each
