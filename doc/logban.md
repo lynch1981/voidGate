@@ -125,6 +125,7 @@ log_format logban '$remote_addr - $remote_user [$time_local] "$request" '
 | first word | the address that is judged and banned. It **must be the TCP peer** (§8). |
 | `$time_local` | window time, timezone included, so replays are exact |
 | `$request` | the path, without its query string; a malformed request line gives an empty path, still counted |
+| `$http_user_agent` | profile matching only (§5.4); never trusted to exempt |
 | `urt=` | backend seconds: the sum of every upstream tried (`0.5, 0.2 : 0.1`) |
 | `rt=` | used when `urt` is `-` (nginx answered itself) |
 
@@ -177,7 +178,7 @@ to see which paths cost the most backend time.
 
 | Rule | Fires when (defaults) | Catches |
 |---|---|---|
-| `ratio` | `costly >= min_costly` (100) **and** `costly / total >= ratio` (0.9) | bots looping on costly URLs |
+| `ratio` | `costly >= min_costly` (100) **and** `costly / total >= ratio` (0.9; `off` turns it off) | bots looping on costly URLs |
 | `backend` | backend seconds `>= max_backend_seconds` (0 = off) | a client heavy on the backend whatever it requests |
 
 `min_costly` stops a short browsing burst from tripping the ratio. The
@@ -191,6 +192,39 @@ busy on average. `30` in a 60 s window is half a worker. Choose it from
 address carries many users' backend time, so it is the first legitimate
 client this rule hits; in the synthetic log of §11 it peaks at 146 s,
 ten times any single browser.
+
+### 5.4 Profiles
+
+Some clients cannot be judged by the ratio: an app or integration that
+calls an API and nothing else has a ratio near 1.0 by design. A profile
+gives a class of requests its own thresholds:
+
+```
+profile api = ua:^MyShop/        # or path:^/api/v1/; lines with one name OR
+api.ratio = off
+api.max_backend_seconds = 30     # half a worker per address
+```
+
+- **Chosen per request.** The first declared profile whose `ua:` or
+  `path:` regex matches; `default` (the global keys) when none does.
+- **Counted apart.** The window is keyed by (address, profile). One NAT
+  address with app users and browsers keeps two counters, so the app's
+  costly calls do not push the browsers' ratio over the line.
+- **Banned as one.** A rule firing in any profile bans the address, and
+  clears all its counters. The rule is named after the profile:
+  `rule=api.backend`.
+- **Thresholds, not exemptions.** A user agent is free to forge. A bot
+  that copies the app's gets the app's limits, and
+  `api.max_backend_seconds` still bans it. That is why a profile cannot
+  turn every rule off: a declared profile in which no rule can fire is a
+  config error. `default` may judge nothing, if a profile does.
+- Overridable: `min_costly`, `ratio`, `max_backend_seconds`. What is
+  costly, the window and the ttl stay global.
+- **NAT adds up.** A NAT address carrying 30 app users uses 30 users'
+  backend time. In a synthetic test, one app install peaked at 4.8 s
+  (p99.9), a NAT with ~30 of them at 31.4 s, and a bot forging the app's
+  user agent at 379 s: `api.max_backend_seconds = 30` banned the NAT too,
+  100 would separate them. Read `--top-clients` before choosing.
 
 ## 6. Exemptions
 
@@ -238,10 +272,10 @@ the result is cached.
 
 ### 6.4 Skipped paths
 
-`skip` is for clients whose ratio is near 1.0 by design: mobile apps and
-integrations calling an API and nothing else. Their requests are left out
-of the window and of the path report. Rate-limit those paths in nginx
-instead.
+`skip` paths are left out of the window and of the path report: nothing
+sent to them can get anyone banned, a flood included. For clients whose
+ratio is near 1.0 by design, use a profile (§5.4) instead. Keep `skip`
+for health checks and the like, and rate-limit them in nginx.
 
 ## 7. Bans
 
@@ -386,19 +420,21 @@ stderr:
 `--top-paths N` then prints the N paths with the most backend seconds,
 or the most requests when the log has no timing fields.
 
-`--top-clients N` prints the N clients with the highest **peak** backend
-seconds in one window, with that peak as workers, its requests and costly
+`--top-clients N` prints the N (client, profile) pairs with the highest
+**peak** backend seconds in one window, with that peak as workers, its requests and costly
 requests, all their requests in the log, and whether this run banned
 them. Then percentiles of the peaks over the clients that were not
-banned:
+banned, per profile, which is what to choose that profile's
+`max_backend_seconds` from:
 
 ```
-  #  address       backend_s  workers requests   costly   all_req  banned
-  1  203.0.113.6       406.9     6.78      344      339      2979  yes
- 16  100.64.0.1        146.0     2.43      694      112     35982
- 17  198.51.1.184       14.8     0.25       32       12        69
+  #  address       profile  backend_s  workers requests   costly   all_req  banned
+  1  203.0.113.6   default      406.9     6.78      344      339      2979  yes
+ 16  100.64.0.1    default      146.0     2.43      694      112     35982
+ 17  198.51.1.184  default       14.8     0.25       32       12        69
 
-peak backend s per window, 3001 clients not banned: p50 6.4  p90 8.8  p99 11.2  p99.9 13.6  max 146.0
+peak backend s per window, clients not banned:
+  default    3001 clients  p50 6.4  p90 8.8  p99 11.2  p99.9 13.6  max 146.0
 ```
 
 Peaks are sampled at each judgment step. Allowlisted addresses are not
@@ -414,9 +450,11 @@ browsers, a CGNAT address and 15 bots.
 
 | | |
 |---|---|
-| replay | 5.3 s, about 64k lines/s |
+| replay | 5.5 s, about 60k lines/s |
 | bans | all 15 bots, each about 30 s into its attack; no browser, no CGNAT |
 | allowlist filter (§6.1) | about 8 % of that time |
+| one `ua:` profile (§5.4) | about 20 % more: a regex on every line |
+| `--top-clients` | about 30 % more: peaks updated every step |
 
 A busy single VM logs far fewer lines per second. Past that rate, run it
 under PyPy, or sample the log.
@@ -440,6 +478,8 @@ The offense counts are kept for every address ever banned (§15).
   that grants the whole protocol (l7-bridge §11). Use `-n` while tuning.
 - **Crawler spoofing.** User agents are ignored; only forward-confirmed
   reverse DNS exempts (§6.3).
+- **User agent spoofing.** A user agent only picks a profile's
+  thresholds, and every profile must be able to ban (§5.4).
 - **A poisoned CDN list** could turn logban off for large ranges.
   `cdn_allow.py` fetches over HTTPS and refuses anything wider than `/8`
   or `/16` (§9).
@@ -480,6 +520,15 @@ The offense counts are kept for every address ever banned (§15).
   flooded `-v` output (§6.1).
 - **Checking crawlers as lines are read.** That is a DNS lookup per new
   address.
+- **Exempting API clients by user agent.** Their user agent is stable,
+  but anyone can send it; it would be a free pass. Profiles use it to
+  pick thresholds instead (§5.4).
+- **One profile per address** (by its first request, or its most common
+  user agent). A NAT address mixes apps and browsers; counting per
+  (address, profile) keeps each mix honest.
+- **Pricing requests by their path's typical time** instead of measured
+  backend time. A slow, overloaded backend inflates every client's
+  backend seconds during an attack. Not done yet (§15).
 - **Fetching CDN ranges inside logban.** A network dependency in the ban
   loop, and a failure mode in every start. A separate cron job with
   atomic replace keeps logban offline.
@@ -507,6 +556,10 @@ Future work:
 - **A CDN-API action**, banning by real client address at the CDN
   (Cloudflare IP Access Rules), with the Python client library from §14.
 - **More CDN providers** in `cdn_allow.py`.
+- **Typical cost per path**, learned from quiet periods, so the backend
+  rule does not tighten on everyone when the backend slows down.
+- **Profiles by a stronger identity**: a hashed API key or a JA4 TLS
+  fingerprint logged as a field, matched like `ua:`.
 - **Persisting offense counts** across restarts, and pruning them after
   `offense_memory` (today they live as long as the process).
 - **A systemd unit** for follow mode.
@@ -525,6 +578,7 @@ no daemon, about one second.
 | `SocketTest` | the exact `drop <ip> ttl=N` sent; `ok`, a refusal, no daemon |
 | `FollowTest` | follow across a rename rotation, counts kept |
 | `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked |
+| `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 

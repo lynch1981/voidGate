@@ -19,6 +19,17 @@ A request is costly if its path matches a `costly` regex, or its backend
 time is at least `slow_seconds`. A ban lasts 600 s and doubles for each
 repeat, up to a day.
 
+API clients have a ratio near 1.0 by design. Give them a profile with
+their own thresholds, chosen by user agent or path:
+
+```
+profile api = ua:^MyShop/
+api.ratio = off
+api.max_backend_seconds = 30     # half a backend worker per address
+```
+
+A forged user agent gets the same limits, not a pass.
+
 ## Log format
 
 `combined` works. Add timing so logban can find costly paths itself:
@@ -61,8 +72,8 @@ One line per ban:
 2026-10-03T10:00:30Z ban 203.0.113.1 ttl=600 offense=1 total=150 costly=149 ratio=0.99 backend=178.8s rule=ratio
 ```
 
-`logban.conf` documents every key: thresholds, `costly`, `skip`, `allow`,
-`allow_file`, `crawler`, ttl.
+`logban.conf` documents every key: thresholds, `costly`, `profile`,
+`skip`, `allow`, `allow_file`, `crawler`, ttl.
 
 ## Behind Cloudflare
 

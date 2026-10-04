@@ -93,10 +93,9 @@ def merge(*streams):
 class ParseTest(unittest.TestCase):
 
     def test_combined(self):
-        ip, t, path, cost = logban.parse_line(
-            line("203.0.113.7", T0, "/search?q=1"))
-        self.assertEqual((ip, t, path, cost),
-                         ("203.0.113.7", T0, "/search", None))
+        self.assertEqual(logban.parse_line(
+            line("203.0.113.7", T0, "/search?q=1")),
+            ("203.0.113.7", T0, "/search", None, "Mozilla/5.0"))
 
     def test_timing(self):
         self.assertEqual(logban.parse_line(
@@ -112,8 +111,7 @@ class ParseTest(unittest.TestCase):
     def test_ipv6_and_timezone(self):
         s = ('2001:db8::7 - - [03/Oct/2026:18:00:00 +0800] "GET / HTTP/1.1"'
              ' 200 1 "-" "-"\n')
-        ip, t, _, _ = logban.parse_line(s)
-        self.assertEqual((ip, t), ("2001:db8::7", T0))
+        self.assertEqual(logban.parse_line(s)[:2], ("2001:db8::7", T0))
 
     def test_garbage(self):
         self.assertIsNone(logban.parse_line("not a log line\n"))
@@ -396,7 +394,7 @@ class AllowFileTest(unittest.TestCase):
         finally:
             logban.ipaddress.ip_address = ip_address
 
-        self.assertEqual(set(judge.win.totals), {"203.0.113.7"})
+        self.assertEqual(set(judge.win.totals), {("203.0.113.7", 0)})
         self.assertEqual(judge.unjudged, 451)
         # the path report still sees CDN traffic
         self.assertEqual(judge.paths["/search"][0], 651)
@@ -417,7 +415,7 @@ class AllowFileTest(unittest.TestCase):
         for s in bot("173.245.48.9", n=99):
             judge.feed(s)
 
-        self.assertIn("173.245.48.9", judge.win.totals)
+        self.assertIn(("173.245.48.9", 0), judge.win.totals)
         self.put("173.245.48.0/20\n")
 
         for s in bot("173.245.48.9", n=50, start=T0 + 20):
@@ -700,12 +698,14 @@ class TopClientsTest(unittest.TestCase):
         judge, out = self.report(sorted(lines,
                                         key=lambda s: logban.parse_line(s)[1]))
 
-        self.assertEqual(judge.peaks["198.51.100.1"], [50.0, 100, 0, 120])
-        self.assertEqual(judge.peaks["198.51.100.2"], [10.0, 10, 0, 10])
+        self.assertEqual(judge.peaks[("198.51.100.1", 0)],
+                         [50.0, 100, 0, 120])
+        self.assertEqual(judge.peaks[("198.51.100.2", 0)], [10.0, 10, 0, 10])
         rows = out.splitlines()
         self.assertIn("peak backend seconds", rows[1])
-        self.assertRegex(rows[3], r"^  1  198\.51\.100\.1 +50\.0 +0\.83 +100 ")
-        self.assertIn("2 clients not banned: p50 10.0  p90 50.0", out)
+        self.assertRegex(rows[3], r"^  1  198\.51\.100\.1  default +50\.0"
+                                  r" +0\.83 +100 ")
+        self.assertIn("default       2 clients  p50 10.0  p90 50.0", out)
 
     def test_banned_flagged_not_in_percentiles(self):
         lines = merge(bot("203.0.113.7", rt="0.5", urt="0.5"),
@@ -713,13 +713,13 @@ class TopClientsTest(unittest.TestCase):
                           urt="0.1"))
         _, out = self.report(lines)
         self.assertRegex(out, r"203\.0\.113\.7 .* yes\n")
-        self.assertIn("1 clients not banned: p50 4.0", out)
+        self.assertIn("default       1 clients  p50 4.0", out)
 
     def test_allowlisted_not_shown(self):
         lines = merge(bot("192.0.2.1", rt="1", urt="1"),
                       bot("198.51.100.1", n=5, rt="1", urt="1"))
         judge, out = self.report(lines, allow=["192.0.2.0/24"])
-        self.assertEqual(set(judge.peaks), {"198.51.100.1"})
+        self.assertEqual(set(judge.peaks), {("198.51.100.1", 0)})
         self.assertNotIn("192.0.2.1", out)
 
     def test_no_timing(self):
@@ -733,6 +733,154 @@ class TopClientsTest(unittest.TestCase):
     def test_off_by_default(self):
         _, _, judge = run(config(), bot("198.51.100.1", n=5))
         self.assertIsNone(judge.peaks)
+
+
+APP = "MyShop/5.2.1 (iOS 18.0)"
+
+
+def app(ip, n=200, path="/api/search", start=T0, every=0.2, urt="0.05"):
+    return bot(ip, n=n, path=path, start=start, every=every, rt=urt,
+               urt=urt, ua=APP)
+
+
+def api_config(**kw):
+    cfg = logban.Config()
+    lines = ["costly = ^/search", "costly = ^/api/search",
+             "profile api = ua:^MyShop/", "api.ratio = off",
+             "api.max_backend_seconds = 30"]
+    lines += ["%s = %s" % kv for kv in kw.items()]
+
+    for ln in lines:
+        k, _, v = ln.partition("=")
+        cfg.set(k.strip(), v.strip())
+
+    cfg.check()
+    return cfg
+
+
+class ProfileTest(unittest.TestCase):
+
+    def test_config(self):
+        cfg = api_config(min_costly=50)
+        default, api = cfg.profiles
+
+        self.assertEqual((default.name, default.prefix), ("default", ""))
+        self.assertEqual((default.min_costly, default.ratio,
+                          default.max_backend_seconds), (50, 0.9, 0.0))
+        self.assertEqual((api.name, api.prefix), ("api", "api."))
+        self.assertEqual((api.min_costly, api.ratio,
+                          api.max_backend_seconds), (50, None, 30.0))
+
+    def test_config_errors(self):
+        base = "costly = x\n"
+
+        for text in ("profile api = ua\n",            # no field
+                     "profile api = agent:x\n",       # unknown field
+                     "profile api = ua:\n",           # empty regex
+                     "profile api = ua:(\n",          # bad regex
+                     "profile Api = ua:x\n",          # bad name
+                     "profile default = ua:x\n",      # reserved
+                     "api.ratio = 0.5\n",             # undeclared
+                     "profile api = ua:x\napi.ratio = 2\n",
+                     "profile api = ua:x\napi.min_costly = 0\n",
+                     # declared, but nothing can fire
+                     "profile api = ua:x\napi.ratio = off\n",
+                     "profile api = ua:x\napi.bogus = 1\n"):
+            with self.assertRaises(logban.ConfigError, msg=text):
+                ConfigTest.load(self, base + text)
+
+        # ratio off everywhere and no backend rule: nothing can fire
+        with self.assertRaises(logban.ConfigError):
+            ConfigTest.load(self, base + "ratio = off\n")
+
+        # default may judge nothing while a profile does
+        cfg = ConfigTest.load(self, "ratio = off\nprofile api = path:^/a"
+                                    "\napi.max_backend_seconds = 5\n")
+        self.assertIsNone(cfg.profiles[0].ratio)
+
+    def test_matching(self):
+        cfg = api_config()
+        cfg.set("profile export", "path:^/export/")
+        cfg.set("profile export", "ua:^ExportBot/")
+        cfg.set("export.max_backend_seconds", "300")
+        cfg.check()
+        judge = logban.Judge(cfg, Recorder(), out=io.StringIO())
+        of = judge.profile_of
+
+        self.assertEqual(of("/", "Mozilla/5.0"), 0)
+        self.assertEqual(of("/api/search", APP), 1)
+        self.assertEqual(of("/export/x", "Mozilla/5.0"), 2)
+        self.assertEqual(of("/", "ExportBot/1"), 2)
+        # the first declared profile wins
+        self.assertEqual(of("/export/x", APP), 1)
+        # no user agent in the log: only path profiles can match
+        self.assertEqual(of("/", ""), 0)
+
+    def test_api_ratio_off(self):
+        # A real app: every request costly, little backend time
+        lines = app("198.51.100.7")
+
+        act, _, _ = run(api_config(), lines)
+        self.assertEqual(act.calls, [])
+
+        # the same traffic without the profile is banned by ratio
+        act, _, _ = run(config(costly=["^/api/search"]), lines)
+        self.assertEqual(len(act.calls), 1)
+
+    def test_faked_ua_still_banned(self):
+        # A bot copying the app's user agent gets the app's thresholds,
+        # not a pass: 200 x 0.5 s in 40 s crosses 30 backend seconds.
+        act, out, _ = run(api_config(), app("203.0.113.7", urt="0.5"))
+        self.assertEqual(act.calls, [("203.0.113.7", 600)])
+        self.assertIn("rule=api.backend", out)
+
+    def test_counted_apart(self):
+        # One NAT address: the app's costly calls do not push the
+        # browsers' ratio over the line.
+        lines = merge(app("100.64.0.1"),
+                      browser("100.64.0.1", n=10, every=4))
+        act, _, judge = run(api_config(), lines)
+        self.assertEqual(act.calls, [])
+
+        act, _, _ = run(api_config(**{"api.max_backend_seconds": "0",
+                                      "api.ratio": "0.9"}), lines)
+        self.assertEqual(len(act.calls), 1)
+
+    def test_ban_clears_every_profile(self):
+        cfg = api_config()
+        judge = logban.Judge(cfg, Recorder(), out=io.StringIO())
+
+        # the ban comes at end of input, so no line re-enters after it
+        for s in merge(app("203.0.113.7", n=20),
+                       bot("203.0.113.7", n=100)):
+            judge.feed(s)
+
+        self.assertEqual({k[1] for k in judge.win.totals}, {0, 1})
+        judge.finish()
+        self.assertEqual(len(judge.act.calls), 1)
+        self.assertEqual(judge.win.totals, {})
+
+    def test_top_clients_per_profile(self):
+        cfg = api_config()
+        out = io.StringIO()
+        judge = logban.Judge(cfg, Recorder(), out=out)
+        judge.peaks = {}
+
+        for s in merge(app("198.51.100.7", n=100),
+                       browser("198.51.100.7", n=20),
+                       browser("198.51.100.8", n=20)):
+            judge.feed(s)
+
+        judge.finish()
+        judge.report_clients(10)
+        text = out.getvalue()
+
+        self.assertEqual(sorted(judge.peaks),
+                         [("198.51.100.7", 0), ("198.51.100.7", 1),
+                          ("198.51.100.8", 0)])
+        self.assertRegex(text, r"198\.51\.100\.7  api +5\.0 ")
+        self.assertRegex(text, r"\n  default +2 clients ")
+        self.assertRegex(text, r"\n  api +1 clients  p50 5\.0")
 
 
 if __name__ == "__main__":

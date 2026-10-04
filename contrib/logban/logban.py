@@ -44,7 +44,7 @@ MAX_TTL = 31536000
 # nginx escapes '"' inside variables as \x22, so [^"]* is safe.
 LINE = re.compile(
     r'(\S+) \S+ \S+ \[([^\]]+)\] "([^"]*)" (\d{3}) \S+'
-    r'(?: "[^"]*" "[^"]*")?(.*)')
+    r'(?: "[^"]*" "([^"]*)")?(.*)')
 # $upstream_response_time has spaces between tries: "0.5, 0.2 : 0.1".
 TIMING = re.compile(r'\b(rt|urt)=([-\d.,: ]+)')
 NUMBER = re.compile(r'\d+(?:\.\d+)?')
@@ -136,6 +136,33 @@ class AllowFiles:
         return True
 
 
+def parse_ratio(value):
+    return None if value == "off" else float(value)
+
+
+class Profile:
+    """A set of thresholds, chosen per request by user agent or path.
+    Index 0 is "default": the global keys, for requests no profile
+    matched."""
+
+    KEYS = {
+        "min_costly": int,
+        "ratio": parse_ratio,
+        "max_backend_seconds": float,
+    }
+    NAME = re.compile(r"[a-z][a-z0-9_]*")
+
+    def __init__(self, name):
+        self.name = name
+        self.prefix = "" if name == "default" else name + "."
+        self.match = []             # (field, regex), any one matches
+        self.keys = {}              # overrides of the global KEYS
+
+    def matches(self, path, ua):
+        return any(rx.search(path if field == "path" else ua)
+                   for field, rx in self.match)
+
+
 class Config:
 
     # key: (type, default); list keys may repeat.
@@ -143,7 +170,7 @@ class Config:
         "window": (int, 60),
         "step": (int, 10),
         "min_costly": (int, 100),
-        "ratio": (float, 0.9),
+        "ratio": (parse_ratio, 0.9),
         "slow_seconds": (float, 0.0),
         "max_backend_seconds": (float, 0.0),
         "ttl": (int, 600),
@@ -163,6 +190,15 @@ class Config:
                       ipaddress.ip_network("::1/128")]
         self.allow_files = AllowFiles()
         self.crawler = []
+        self.profiles = [Profile("default")]
+        self.pending = []           # (profile, key, value) until check()
+
+    def profile(self, name):
+        for p in self.profiles:
+            if p.name == name:
+                return p
+
+        return None
 
     def load(self, path):
         with open(path) as f:
@@ -204,6 +240,28 @@ class Config:
         elif key == "crawler":
             self.crawler.append("." + value.lstrip("."))
 
+        elif key.startswith("profile "):
+            name = key[8:].strip()
+            field, sep, rx = value.partition(":")
+
+            if not Profile.NAME.fullmatch(name) or name == "default":
+                raise ValueError("bad profile name %r" % name)
+
+            if not sep or field not in ("ua", "path") or not rx:
+                raise ValueError("expected ua:<regex> or path:<regex>")
+
+            p = self.profile(name)
+
+            if p is None:
+                p = Profile(name)
+                self.profiles.append(p)
+
+            p.match.append((field, re.compile(rx)))
+
+        elif "." in key and key.split(".", 1)[1] in Profile.KEYS:
+            name, sub = key.split(".", 1)
+            self.pending.append((name, sub, Profile.KEYS[sub](value)))
+
         else:
             raise ValueError("unknown key")
 
@@ -213,14 +271,45 @@ class Config:
         if self.step < 1 or self.window < self.step:
             raise ConfigError("need 1 <= step <= window")
 
-        if not 0 < self.ratio <= 1:
-            raise ConfigError("ratio must be in (0, 1]")
-
         if not 1 <= self.ttl <= self.max_ttl <= MAX_TTL:
             raise ConfigError("need 1 <= ttl <= max_ttl <= %d" % MAX_TTL)
 
-        if (not self.costly and self.slow_seconds <= 0
-                and self.max_backend_seconds <= 0):
+        for name, sub, value in self.pending:
+            p = self.profile(name)
+
+            if p is None:
+                raise ConfigError("%s.%s: no profile %s" % (name, sub, name))
+
+            p.keys[sub] = value
+
+        any_costly = self.costly or self.slow_seconds > 0
+        fires = []
+
+        for p in self.profiles:
+            for key in Profile.KEYS:
+                setattr(p, key, p.keys.get(key, getattr(self, key)))
+
+            if p.ratio is not None and not 0 < p.ratio <= 1:
+                raise ConfigError("%sratio must be in (0, 1] or off"
+                                  % p.prefix)
+
+            if p.min_costly < 1:
+                raise ConfigError("%smin_costly must be at least 1"
+                                  % p.prefix)
+
+            fire = ((p.ratio is not None and any_costly)
+                    or p.max_backend_seconds > 0)
+
+            # A declared profile that judges nothing is a mistake; use
+            # skip to not judge requests.
+            if not fire and p.name != "default":
+                raise ConfigError("profile %s: no rule can fire: ratio is"
+                                  " off or nothing is costly, and"
+                                  " max_backend_seconds is 0" % p.name)
+
+            fires.append(fire)
+
+        if not any(fires):
             raise ConfigError("nothing is costly: set costly, slow_seconds"
                               " or max_backend_seconds")
 
@@ -242,14 +331,15 @@ def parse_time(s):
 
 
 def parse_line(line):
-    """Return (ip, epoch, path, backend_seconds or None), or None."""
+    """Return (ip, epoch, path, backend_seconds or None, user agent),
+    or None."""
 
     m = LINE.match(line)
 
     if m is None:
         return None
 
-    ip, stamp, request, _, rest = m.groups()
+    ip, stamp, request, _, ua, rest = m.groups()
 
     try:
         t = parse_time(stamp)
@@ -272,12 +362,12 @@ def parse_line(line):
             cost = sum(float(v) for v in values)
             break
 
-    return ip, t, path, cost
+    return ip, t, path, cost, ua or ""
 
 
 class Window:
-    """Per-address [total, costly, backend seconds] over the last
-    `buckets` steps, kept as running sums."""
+    """Per (address, profile) [total, costly, backend seconds] over the
+    last `buckets` steps, kept as running sums."""
 
     def __init__(self, step, buckets):
         self.step = step
@@ -286,12 +376,12 @@ class Window:
         self.totals = {}
         self.cur = None
 
-    def add(self, ip, costly, cost):
+    def add(self, key, costly, cost):
         for d in (self.buckets[-1], self.totals):
-            s = d.get(ip)
+            s = d.get(key)
 
             if s is None:
-                s = d[ip] = [0, 0, 0.0]
+                s = d[key] = [0, 0, 0.0]
 
             s[0] += 1
             s[1] += costly
@@ -301,11 +391,11 @@ class Window:
         self.buckets.append({})
 
         if len(self.buckets) > self.size:
-            for ip, s in self.buckets.popleft().items():
-                t = self.totals[ip]
+            for key, s in self.buckets.popleft().items():
+                t = self.totals[key]
 
                 if t[0] == s[0]:
-                    del self.totals[ip]
+                    del self.totals[key]
                     continue
 
                 t[0] -= s[0]
@@ -317,11 +407,12 @@ class Window:
         self.totals.clear()
         self.buckets.append({})
 
-    def remove(self, ip):
-        self.totals.pop(ip, None)
+    def remove(self, keys):
+        for key in keys:
+            self.totals.pop(key, None)
 
-        for b in self.buckets:
-            b.pop(ip, None)
+            for b in self.buckets:
+                b.pop(key, None)
 
 
 class Judge:
@@ -353,7 +444,7 @@ class Judge:
             self.skipped += 1
             return
 
-        ip, t, path, cost = r
+        ip, t, path, cost, ua = r
         self.lines += 1
         self.clock(t)
 
@@ -381,16 +472,29 @@ class Judge:
                   or (cost is not None and self.cfg.slow_seconds > 0
                       and cost >= self.cfg.slow_seconds))
 
-        self.win.add(ip, int(costly), cost or 0.0)
+        key = (ip, self.profile_of(path, ua)
+                   if len(self.cfg.profiles) > 1 else 0)
+        self.win.add(key, int(costly), cost or 0.0)
 
         if self.peaks is not None:
-            pk = self.peaks.get(ip)
+            pk = self.peaks.get(key)
 
             if pk is None:
                 # peak backend s, peak requests, peak costly, all requests
-                pk = self.peaks[ip] = [0.0, 0, 0, 0]
+                pk = self.peaks[key] = [0.0, 0, 0, 0]
 
             pk[3] += 1
+
+    def profile_of(self, path, ua):
+        """Index of the first profile that matches, 0 for default."""
+
+        profiles = self.cfg.profiles
+
+        for i in range(1, len(profiles)):
+            if profiles[i].matches(path, ua):
+                return i
+
+        return 0
 
     def clock(self, t):
         """Move the window to time t. A late line (nginx logs a request
@@ -431,19 +535,23 @@ class Judge:
         if cfg.allow_files.refresh():
             self.listed.clear()
 
-        for ip, (total, costly, cost) in list(self.win.totals.items()):
+        for key, (total, costly, cost) in list(self.win.totals.items()):
+            ip, pi = key
+            p = cfg.profiles[pi]
+
             if self.peaks is not None:
-                pk = self.peaks[ip]
+                pk = self.peaks[key]
                 pk[0] = max(pk[0], cost)
                 pk[1] = max(pk[1], total)
                 pk[2] = max(pk[2], costly)
 
-            if costly >= cfg.min_costly and costly >= cfg.ratio * total:
-                rule = "ratio"
+            if p.ratio is not None and costly >= p.min_costly \
+                    and costly >= p.ratio * total:
+                rule = p.prefix + "ratio"
 
-            elif cfg.max_backend_seconds > 0 \
-                    and cost >= cfg.max_backend_seconds:
-                rule = "backend"
+            elif p.max_backend_seconds > 0 \
+                    and cost >= p.max_backend_seconds:
+                rule = p.prefix + "backend"
 
             else:
                 continue
@@ -487,7 +595,8 @@ class Judge:
 
         if self.history is not None:
             self.history.append((now, ip, ttl, total, costly, cost, rule))
-        self.win.remove(ip)
+
+        self.win.remove([(ip, i) for i in range(len(cfg.profiles))])
 
         if len(self.banned) > 65536:
             self.banned = {k: v for k, v in self.banned.items() if v > now}
@@ -578,6 +687,8 @@ class Judge:
 
         col = 0 if self.timed else 1
         rows = sorted(self.peaks.items(), key=lambda kv: (-kv[1][col], kv[0]))
+        names = [p.name for p in self.cfg.profiles]
+        pw = max(len(n) for n in names)
         out = self.out
 
         out.write("\nclients by peak %s in one %d s window"
@@ -586,30 +697,35 @@ class Judge:
                      self.cfg.window))
 
         if rows:
-            width = max(len(ip) for ip, _ in rows[:n])
-            out.write("%3s  %-*s %10s %8s %8s %8s %9s  %s\n"
-                      % ("#", width, "address", "backend_s", "workers",
-                         "requests", "costly", "all_req", "banned"))
+            width = max(len(ip) for (ip, _), _ in rows[:n])
+            out.write("%3s  %-*s  %-*s %10s %8s %8s %8s %9s  %s\n"
+                      % ("#", width, "address", pw, "profile", "backend_s",
+                         "workers", "requests", "costly", "all_req",
+                         "banned"))
 
-        for i, (ip, pk) in enumerate(rows[:n], 1):
-            out.write("%3d  %-*s %10.1f %8.2f %8d %8d %9d  %s\n"
-                      % (i, width, ip, pk[0], pk[0] / self.cfg.window,
-                         pk[1], pk[2], pk[3],
+        for i, ((ip, pi), pk) in enumerate(rows[:n], 1):
+            out.write("%3d  %-*s  %-*s %10.1f %8.2f %8d %8d %9d  %s\n"
+                      % (i, width, ip, pw, names[pi], pk[0],
+                         pk[0] / self.cfg.window, pk[1], pk[2], pk[3],
                          "yes" if ip in self.offenses else ""))
 
-        kept = sorted(pk[col] for ip, pk in rows if ip not in self.offenses)
-
-        if not kept:
-            return
-
-        def rank(q):
+        def rank(kept, q):
             # nearest rank
             return kept[max(0, math.ceil(len(kept) * q / 100) - 1)]
 
-        out.write("\npeak %s per window, %d clients not banned:"
-                  " p50 %s  p90 %s  p99 %s  p99.9 %s  max %s\n"
-                  % ("backend s" if self.timed else "requests", len(kept),
-                     *("%.1f" % rank(q) for q in (50, 90, 99, 99.9, 100))))
+        out.write("\npeak %s per window, clients not banned:\n"
+                  % ("backend s" if self.timed else "requests"))
+
+        for pi, name in enumerate(names):
+            kept = sorted(pk[col] for (ip, i), pk in rows
+                          if i == pi and ip not in self.offenses)
+
+            if kept:
+                out.write("  %-*s %7d clients  p50 %s  p90 %s  p99 %s"
+                          "  p99.9 %s  max %s\n"
+                          % (pw, name, len(kept),
+                             *("%.1f" % rank(kept, q)
+                               for q in (50, 90, 99, 99.9, 100))))
 
         if not self.timed:
             out.write("(no rt=/urt= in the log: requests, not backend"
