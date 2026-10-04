@@ -23,6 +23,7 @@ Contents:
 14. [Alternatives considered](#14-alternatives-considered)
 15. [Limits and future work](#15-limits-and-future-work)
 16. [Tests](#16-tests)
+17. [Real logs](#17-real-logs)
 
 ## 1. Problem
 
@@ -957,6 +958,7 @@ integration scripts.
 | `ClusterTest` | a 30-address botnet each under every threshold: no ban by per-address rules, all banned by the cluster, ban line with size, ja4 and ua; user agent alone without `ja4=`; 50 browsers on one stack pass; search-only users inside a browser cluster pass; a member that browses and one with 2 costly requests pass; below `cluster_min_addresses`, below `cluster_min_costly`, spread over 10 minutes; ratio-off profiles not clustered; allowlisted not counted, verified crawlers not banned; off by default; `--explain` rows; config bounds only when on. Each of the three safety conditions was removed in turn and a test failed. |
 | `JsonTest` | the same tuple as `combined` for the same request; `urt` with several upstreams, `-` falling back to `rt`, both absent; `ja4` from either name, `-` as none; `time_iso8601` with offsets and `msec` as string or number; `request_method` + `request_uri`; unparsed (cut short, no address, bad or wrong-typed time); `json_*` keys; the same bans in each format and mixed in one file; every line of the `data/` sample parses |
 | `TimeTest` | the `time_local` fast path equals `strptime` (also checked on 20,000 random stamps and offsets while writing it); out-of-range and misshapen stamps rejected |
+| `DataTest` | replays of `data/` (§17): with `data/me.conf`, 261 addresses banned, all by honey, no Cloudflare edge, no address that loaded the game, over 70 % of requests dropped, `80.94.95.211` banned before its `.git` downloads; without the Cloudflare allowlist, over 100 edges banned; the generated JSON sample parses whole and bans nothing |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
@@ -968,3 +970,54 @@ integration scripts.
 That XDP then drops the address is `t/drop-ttl-xdp.t`'s job: logban sends
 the same `drop <ip> ttl=N` as `voidgatectl`. The test fails against the
 logban before this fix: the protected address was asked 29 times.
+
+## 17. Real logs
+
+`contrib/logban/data/` holds two nginx logs, replayed by `DataTest`.
+
+### 17.1 `me.access.log`
+
+A real `combined` log, no timing fields, of a small static site (a
+browser game: `/`, `*.js`, `style.css`), 20 Sep to 4 Oct 2026: 34,946
+lines from 1,983 addresses.
+
+- **Mostly scanners.** 92 % of answers are 4xx. The two busiest
+  addresses sent 10,069 and 5,406 requests over 2,000 distinct paths
+  each; the top 404s are `/.env` in every spelling, `/.git/config`,
+  `.aws`, `phpinfo.php`, `docker-compose.yml`.
+- **20 % arrives through Cloudflare**, from 975 edge addresses, scanners
+  included.
+- **Fake crawlers.** All 1,050 requests with Googlebot's user agent came
+  from five addresses with no reverse DNS.
+- **A leak, in the log.** On 20 Sep at 00:31 and 01:52, `/.git/config`,
+  `/.git/HEAD` and `/.git/logs/HEAD` were answered 200; from 04:38 on,
+  404. `/README.md` is served too: the document root was a git checkout.
+
+`data/me.conf` was built from the log: honey paths from the 404s most
+addresses sent, checked against every path the site served; a 404 watch
+with a ratio for the rest; the crawler list. Replayed:
+
+| | Without the Cloudflare allowlist | `data/me.conf` |
+|---|---|---|
+| addresses banned | 253, **136 of them Cloudflare edges** | 261, all by honey |
+| addresses that loaded the game, banned | | 0 |
+| requests that XDP would have dropped | 84 % | 72 % |
+| requests a banned scanner sent before its first ban | | median 3, at most 13 |
+
+- **The allowlist is not optional** on a site behind a CDN (§8): without
+  it, every visitor behind 136 edges would have been cut off.
+- **Honey did the work.** The watch never fired: honey caught every
+  scanner first.
+- **One of the two `.git` leaks would have been stopped.** `80.94.95.211`
+  was banned on its first request, 21 s before it fetched `.git`.
+  `77.83.39.94` asked for `/.git/config` first: logban sees a request
+  only after nginx answered it (§5.6). Keep secrets out of the document
+  root, and `return 404` for `/.git` in nginx.
+
+### 17.2 `clickHouse.access.log`
+
+Generated sample data in nginx JSON (§4.2): 14,743 lines, each from a
+different address, one host, evenly spread methods and user agents. It
+checks JSON parsing at scale (every line parses; the reports equal those
+of the same lines converted to `combined`) and that a log with one
+request per address bans no one, clusters included.

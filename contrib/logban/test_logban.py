@@ -1798,5 +1798,108 @@ class TimeTest(unittest.TestCase):
                 logban.parse_time_local(s)
 
 
+# Cloudflare's ranges on 2026-10-04 (api.cloudflare.com/client/v4/ips),
+# fixed so the replay below needs no network.
+CLOUDFLARE = """103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 104.16.0.0/13
+104.24.0.0/14 108.162.192.0/18 131.0.72.0/22 141.101.64.0/18 162.158.0.0/15
+172.64.0.0/13 173.245.48.0/20 188.114.96.0/20 190.93.240.0/20 197.234.240.0/22
+198.41.128.0/17 2400:cb00::/32 2405:8100::/32 2405:b500::/32 2606:4700::/32
+2803:f800::/32 2a06:98c0::/29 2c0f:f248::/32""".split()
+
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+class DataTest(unittest.TestCase):
+    """Replays of the logs in data/: guards the results in doc/logban.md
+    section 17 against later changes."""
+
+    def setUp(self):
+        if not os.path.exists(os.path.join(DATA, "me.access.log")):
+            self.skipTest("no data/")
+
+    def replay(self, conf_text, log):
+        d = tempfile.mkdtemp()
+        cdn = os.path.join(d, "cdn.txt")
+        conf = os.path.join(d, "me.conf")
+
+        with open(cdn, "w") as f:
+            f.write("\n".join(CLOUDFLARE) + "\n")
+
+        with open(conf, "w") as f:
+            f.write(conf_text.replace("/etc/logban/cdn-allow.txt", cdn))
+
+        cfg = logban.Config()
+        cfg.load(conf)
+        # no DNS in tests: as in the real replay, no crawler verifies
+        judge = logban.Judge(cfg, logban.dry_run, out=io.StringIO(),
+                             resolve=lambda n: ([], set()))
+        judge.history = []
+        dropped = 0
+
+        with open(os.path.join(DATA, log), errors="replace") as f:
+            lines = f.readlines()
+
+        for s in lines:
+            r = logban.parse_line(s, cfg.json_fields)
+
+            if r and judge.banned.get(r[0], 0) > r[1]:
+                dropped += 1
+
+            judge.feed(s)
+
+        judge.finish()
+        return judge, lines, dropped
+
+    def test_me(self):
+        with open(os.path.join(DATA, "me.conf")) as f:
+            judge, lines, dropped = self.replay(f.read(), "me.access.log")
+
+        banned = {b[1] for b in judge.history}
+        nets = [logban.ipaddress.ip_network(n) for n in CLOUDFLARE]
+        players = set()
+
+        for s in lines:
+            r = logban.parse_line(s)
+
+            if r and r[2].endswith((".js", ".css")) and r[7][0] in "23":
+                players.add(r[0])
+
+        self.assertEqual(len(banned), 261)
+        self.assertEqual({b[6] for b in judge.history}, {"honey"})
+        self.assertFalse([ip for ip in banned if any(
+            logban.ipaddress.ip_address(ip) in n for n in nets)],
+            "Cloudflare edges banned")
+        self.assertEqual(banned & players, set(), "players banned")
+        self.assertIn("213.209.159.175", banned)
+        self.assertGreater(dropped / len(lines), 0.70)
+
+        # banned before it downloaded .git (20 Sep 01:52:18)
+        first = min(b[0] for b in judge.history if b[1] == "80.94.95.211")
+        self.assertLess(first, datetime(2026, 9, 20, 1, 52, 18,
+                                        tzinfo=timezone.utc).timestamp())
+
+    def test_cloudflare_allowlist_matters(self):
+        with open(os.path.join(DATA, "me.conf")) as f:
+            text = "\n".join(ln for ln in f.read().splitlines()
+                             if not ln.startswith("allow_file"))
+
+        judge, _, _ = self.replay(text, "me.access.log")
+        nets = [logban.ipaddress.ip_network(n) for n in CLOUDFLARE]
+        edges = {b[1] for b in judge.history
+                 if any(logban.ipaddress.ip_address(b[1]) in n for n in nets)}
+        self.assertGreater(len(edges), 100)
+
+    def test_generated_json_sample(self):
+        # one request per address: nothing to ban, clusters included
+        judge, lines, _ = self.replay(
+            "costly = ^/(api|checkout|admin)/\nslow_seconds = 1.0\n"
+            "watch errors = status:5..\nerrors.max = 5\n"
+            "cluster_min_addresses = 10\ncluster_min_costly = 50\n",
+            "clickHouse.access.log")
+        self.assertEqual(judge.history, [])
+        self.assertEqual(judge.skipped, 0)
+        self.assertEqual(judge.lines, len(lines))
+
+
 if __name__ == "__main__":
     unittest.main()
