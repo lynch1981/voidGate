@@ -315,6 +315,7 @@ class Config:
         "json_ja4": (str, "ja4, http_ssl_ja4"),
     }
     LISTS = ("costly", "skip", "honey", "allow", "allow_file", "crawler")
+    NAMED = re.compile(r"(profile|watch)\s+(\S.*)")
     # rule names a watch would be confused with
     RESERVED = ("default", "ratio", "backend", "honey")
 
@@ -372,6 +373,10 @@ class Config:
         self.check()
 
     def set(self, key, value):
+        # "profile <name>" and "watch <name>": any whitespace between
+        m = self.NAMED.fullmatch(key)
+        kind, name = m.groups() if m else ("", "")
+
         if key in self.SCALARS:
             setattr(self, key, self.SCALARS[key][0](value))
 
@@ -387,8 +392,7 @@ class Config:
         elif key == "crawler":
             self.crawler.append("." + value.lstrip("."))
 
-        elif key.startswith("profile "):
-            name = key[8:].strip()
+        elif kind == "profile":
             field, sep, rx = value.partition(":")
 
             if not Profile.NAME.fullmatch(name) or name == "default":
@@ -405,9 +409,7 @@ class Config:
 
             p.add(field, rx)
 
-        elif key.startswith("watch "):
-            name = key[6:].strip()
-
+        elif kind == "watch":
             if not Profile.NAME.fullmatch(name) or name in self.RESERVED:
                 raise ValueError("bad watch name %r" % name)
 

@@ -1340,6 +1340,23 @@ class WatchTest(unittest.TestCase):
         ConfigTest.load(self, "watch scan = status:404\nscan.max = 9\n")
         ConfigTest.load(self, "honey = ^/\\.env\n")
 
+    def test_key_whitespace(self):
+        # the type and the name may be split by any run of whitespace
+        for key in ("watch scan", "watch   scan", "watch\tscan",
+                    "watch \t scan"):
+            cfg = ConfigTest.load(self, "costly = x\n%s = status:404\n"
+                                        "scan.max = 5\n" % key)
+            self.assertEqual([w.name for w in cfg.watches], ["scan"], key)
+
+        cfg = ConfigTest.load(self, "costly = x\nprofile\tapi = ua:x\n"
+                                    "api.ratio = 0.5\n")
+        self.assertEqual(cfg.profiles[1].name, "api")
+
+        for key in ("watchscan", "watch", "watch scan two", "Watch scan"):
+            with self.assertRaises(logban.ConfigError, msg=key):
+                ConfigTest.load(self, "costly = x\n%s = status:404\n"
+                                      "scan.max = 5\n" % key)
+
     def test_config_errors(self):
         for text in ("watch scan = status:404\n",                 # no max
                      "watch scan = status:404\nscan.max = 0\n",
