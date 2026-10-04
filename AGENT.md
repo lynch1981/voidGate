@@ -39,6 +39,9 @@ t/integration/*.sh       daemon / OpenResty / veth flood (needs root)
 lua/resty/voidgate.lua   OpenResty client (cosocket) + ban(); the only
                          Lua client (Kong / APISIX run on OpenResty)
 contrib/openresty/       example nginx.conf (not run by the tests)
+contrib/logban/          access-log decider: costly-URL abusers → timed
+                         drops (Python, stdlib only; make test runs its
+                         unit tests)
 ```
 
 Generated, do not edit or commit: `src/bpf/voidgate.skel.h`, `*.o`,
