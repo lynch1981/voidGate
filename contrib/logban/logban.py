@@ -33,6 +33,7 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -300,6 +301,10 @@ class Config:
         "cluster_min_costly": (int, 300),
         "cluster_ratio": (float, 0.9),
         "cluster_member_min": (int, 3),
+        # Only a client whose user agent claims to be a crawler gets the
+        # DNS check, each lookup capped at crawler_timeout seconds.
+        "crawler_ua": (str, r"(?i)bot|crawl|spider|slurp|google"),
+        "crawler_timeout": (float, 1.0),
         "socket": (str, VG_SOCK_PATH),
         # JSON log lines: the field holding each value, first one present
         # wins. Defaults are nginx's variable names.
@@ -452,6 +457,15 @@ class Config:
             if self.cluster_min_costly < 1 or self.cluster_member_min < 1:
                 raise ConfigError("cluster_min_costly and cluster_member_min"
                                   " must be at least 1")
+
+        try:
+            self.crawler_ua_rx = re.compile(self.crawler_ua)
+
+        except re.error as e:
+            raise ConfigError("crawler_ua: %s" % e)
+
+        if self.crawler_timeout <= 0:
+            raise ConfigError("crawler_timeout must be above 0")
 
         if self.honey and not 1 <= self.honey_ttl <= self.max_ttl:
             raise ConfigError("need 1 <= honey_ttl <= max_ttl")
@@ -1004,6 +1018,9 @@ class Judge:
         self.offenses = {}          # ip -> (count, last)
         self.listed = {}            # ip -> "allow", "bad-address" or ""
         self.crawlers = {}          # ip -> verified crawler (DNS cache)
+        self.claims = set()         # ips whose user agent claimed a crawler
+        self.claim_ua = {}          # user agent -> claims (cache)
+        self.dns_timeouts = 0
         self.paths = {}             # path -> [count, backend seconds]
         self.timed = False
         self.lines = 0
@@ -1029,6 +1046,9 @@ class Judge:
 
         if x:
             x.lines += 1
+
+        if self.cfg.crawler:
+            self.claim(ip, ua)
 
         # A path no real client asks for: ban on the first hit, now, not
         # at the next step. Before skip, so skip cannot hide a probe.
@@ -1376,14 +1396,35 @@ class Judge:
         self.listed[ip] = why
         return why
 
+    def claim(self, ip, ua):
+        """Remember an address that sent a crawler's user agent. Only
+        those get the DNS check: a scanner with a browser's user agent is
+        banned without a lookup, so a reverse zone that never answers
+        cannot stall the loop for it."""
+
+        c = self.claim_ua.get(ua)
+
+        if c is None:
+            if len(self.claim_ua) > 65536:
+                self.claim_ua.clear()
+
+            c = self.claim_ua[ua] = bool(self.cfg.crawler_ua_rx.search(ua))
+
+        if c and ip not in self.claims:
+            if len(self.claims) > 65536:
+                self.claims.clear()
+
+            self.claims.add(ip)
+
     def exempt_reason(self, ip):
         """Checked only for an address that matched a rule. Counts made
         before an allow_file reload are still excused; the DNS crawler
-        check is too slow to run per line."""
+        check is too slow to run per line, and runs only for an address
+        that claimed to be a crawler."""
 
         why = self.listed_reason(ip)
 
-        if why or not self.cfg.crawler:
+        if why or not self.cfg.crawler or ip not in self.claims:
             return why
 
         crawler = self.crawlers.get(ip)
@@ -1402,16 +1443,38 @@ class Judge:
         """Reverse DNS ends in a crawler domain, and that name resolves
         back to ip. The user agent is not trusted."""
 
-        names, addrs = self.resolve(ip)
+        names, _ = self.lookup(ip)
 
         for name in names:
             if name.lower().endswith(tuple(self.cfg.crawler)):
-                _, back = self.resolve(name)
+                _, back = self.lookup(name)
 
                 if ip in back:
                     return True
 
         return False
+
+    def lookup(self, name):
+        """self.resolve(name), given crawler_timeout seconds. A lookup
+        that does not answer in time is "not a crawler"; its thread is
+        left to finish on its own."""
+
+        out = []
+        t = threading.Thread(target=lambda: out.append(self.resolve(name)),
+                             daemon=True)
+        t.start()
+        t.join(self.cfg.crawler_timeout)
+
+        if out:
+            return out[0]
+
+        self.dns_timeouts += 1
+
+        if self.verbose:
+            self.log("crawler check: %s timed out after %.1f s"
+                     % (name, self.cfg.crawler_timeout))
+
+        return [], set()
 
     def report_paths(self, n):
         """Print the paths that cost the backend most (or the most

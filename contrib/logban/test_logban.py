@@ -7,6 +7,7 @@
 import io
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -21,6 +22,8 @@ import cdn_allow  # noqa: E402
 import logban  # noqa: E402
 
 
+GBOT = ("Mozilla/5.0 (compatible; Googlebot/2.1;"
+        " +http://www.google.com/bot.html)")
 T0 = datetime(2026, 10, 3, 10, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
@@ -196,7 +199,8 @@ class JudgeTest(unittest.TestCase):
             "203.0.113.7": (["fake.googlebot.com"], set()),
             "fake.googlebot.com": ([], {"198.51.100.1"}),
         }
-        lines = merge(bot("66.249.66.1"), bot("203.0.113.7"))
+        # both claim Googlebot; only the first is
+        lines = merge(bot("66.249.66.1", ua=GBOT), bot("203.0.113.7", ua=GBOT))
         act, _, _ = run(config(crawler=["googlebot.com"]), lines,
                         resolve=lambda n: dns.get(n, ([], set())))
         self.assertEqual(act.calls, [("203.0.113.7", 600)])
@@ -1129,7 +1133,7 @@ class HoneyTest(unittest.TestCase):
                "crawl.googlebot.com": ([], {"66.249.66.1"})}
         lines = [line("192.0.2.1", T0, "/.env"),
                  line("127.0.0.1", T0, "/.env"),
-                 line("66.249.66.1", T0, "/.env"),
+                 line("66.249.66.1", T0, "/.env", ua=GBOT),
                  line("-", T0, "/.env")]
         act, _, judge = run(config(honey=[HONEY], allow=["192.0.2.0/24"],
                                    crawler=["googlebot.com"]), lines,
@@ -1307,7 +1311,7 @@ class WatchTest(unittest.TestCase):
         dns = {"66.249.66.1": (["crawl.googlebot.com"], set()),
                "crawl.googlebot.com": ([], {"66.249.66.1"})}
         cfg = watch_config(*SCAN, "crawler = googlebot.com")
-        act, _, _ = run(cfg, hits("66.249.66.1", 60, status=404),
+        act, _, _ = run(cfg, hits("66.249.66.1", 60, status=404, ua=GBOT),
                         resolve=lambda n: dns.get(n, ([], set())))
         self.assertEqual(act.calls, [])
 
@@ -1451,7 +1455,7 @@ class ExplainTest(unittest.TestCase):
     def test_crawler(self):
         dns = {"66.249.66.1": (["crawl.googlebot.com"], set()),
                "crawl.googlebot.com": ([], {"66.249.66.1"})}
-        text, _ = self.explain("66.249.66.1", bot("66.249.66.1"),
+        text, _ = self.explain("66.249.66.1", bot("66.249.66.1", ua=GBOT),
                                config(crawler=["googlebot.com"]),
                                resolve=lambda n: dns.get(n, ([], set())))
         self.assertIn("fires ratio, exempt: crawler", text)
@@ -1917,6 +1921,114 @@ class DataTest(unittest.TestCase):
         self.assertEqual(judge.history, [])
         self.assertEqual(judge.skipped, 0)
         self.assertEqual(judge.lines, len(lines))
+
+
+class CrawlerTest(unittest.TestCase):
+
+    def counting(self, table, delay=0.0):
+        calls = []
+
+        def resolve(name):
+            calls.append(name)
+            time.sleep(delay)
+            return table.get(name, ([], set()))
+
+        return resolve, calls
+
+    def test_no_lookup_without_a_crawler_user_agent(self):
+        # a scanner with a browser's user agent: banned, no DNS
+        resolve, calls = self.counting({})
+        lines = [line("203.0.113.%d" % k, T0 + k, "/.env") for k in range(20)]
+        act, _, judge = run(config(honey=[HONEY], crawler=["googlebot.com"]),
+                            lines, resolve=resolve)
+        self.assertEqual(len(act.calls), 20)
+        self.assertEqual(calls, [])
+
+    def test_fake_googlebot_looked_up_and_banned(self):
+        resolve, calls = self.counting({})
+        act, _, _ = run(config(honey=[HONEY], crawler=["googlebot.com"]),
+                        [line("203.0.113.7", T0, "/.env", ua=GBOT)],
+                        resolve=resolve)
+        self.assertEqual(act.calls, [("203.0.113.7", 3600)])
+        self.assertEqual(calls, ["203.0.113.7"])
+
+    def test_one_claim_is_enough(self):
+        # browsing as Googlebot earlier, the probe without the user agent
+        table = {"66.249.66.1": (["crawl.googlebot.com"], set()),
+                 "crawl.googlebot.com": ([], {"66.249.66.1"})}
+        resolve, calls = self.counting(table)
+        lines = [line("66.249.66.1", T0, "/", ua=GBOT),
+                 line("66.249.66.1", T0 + 1, "/.env", ua="curl/8")]
+        act, _, _ = run(config(honey=[HONEY], crawler=["googlebot.com"]),
+                        lines, resolve=resolve)
+        self.assertEqual(act.calls, [])
+        self.assertEqual(calls, ["66.249.66.1", "crawl.googlebot.com"])
+
+    def test_slow_dns_capped(self):
+        # a reverse zone that takes 2 s: given up after crawler_timeout,
+        # treated as not a crawler, and the loop moves on
+        resolve, calls = self.counting({}, delay=2.0)
+        cfg = config(honey=[HONEY], crawler=["googlebot.com"],
+                     crawler_timeout=0.2)
+        err = io.StringIO()
+        saved, sys.stderr = sys.stderr, err
+
+        try:
+            start = time.time()
+            judge = logban.Judge(cfg, Recorder(), out=io.StringIO(),
+                                 verbose=1, resolve=resolve)
+
+            for s in [line("203.0.113.%d" % k, T0 + k, "/.env", ua=GBOT)
+                      for k in range(3)]:
+                judge.feed(s)
+
+            elapsed = time.time() - start
+
+        finally:
+            sys.stderr = saved
+
+        self.assertEqual(len(judge.act.calls), 3)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(judge.dns_timeouts, 3)
+        self.assertIn("crawler check: 203.0.113.0 timed out after 0.2 s",
+                      err.getvalue())
+
+    def test_user_agent_cache_and_off(self):
+        cfg = config(crawler=["googlebot.com"])
+        judge = logban.Judge(cfg, Recorder(), out=io.StringIO())
+
+        for s in bot("203.0.113.7", n=5) + bot("66.249.66.1", n=5, ua=GBOT):
+            judge.feed(s)
+
+        self.assertEqual(judge.claims, {"66.249.66.1"})
+        self.assertEqual(judge.claim_ua, {"Mozilla/5.0": False, GBOT: True})
+
+        # no crawler list: nothing is tracked
+        _, _, judge = run(config(), bot("66.249.66.1", n=5, ua=GBOT))
+        self.assertEqual(judge.claims, set())
+
+    def test_config(self):
+        cfg = ConfigTest.load(self, "costly = x\ncrawler = example.com\n"
+                                    "crawler_ua = ^MyCrawler/\n"
+                                    "crawler_timeout = 0.5\n")
+        self.assertTrue(cfg.crawler_ua_rx.search("MyCrawler/1.0"))
+        self.assertFalse(cfg.crawler_ua_rx.search("Googlebot"))
+        self.assertTrue(logban.Config().SCALARS["crawler_ua"][1])
+
+        default = re.compile(logban.Config.SCALARS["crawler_ua"][1])
+
+        for ua in (GBOT, "Googlebot-Image/1.0", "Mediapartners-Google",
+                   "Mozilla/5.0 (compatible; bingbot/2.0)", "msnbot/2.0b",
+                   "Mozilla/5.0 (compatible; YandexBot/3.0)", "Slurp",
+                   "Applebot/0.1", "Baiduspider", "AhrefsBot/6.1"):
+            self.assertTrue(default.search(ua), ua)
+
+        self.assertFalse(default.search("Mozilla/5.0 (Windows NT 10.0) "
+                                        "Chrome/129.0 Safari/537.36"))
+
+        for text in ("crawler_ua = (\n", "crawler_timeout = 0\n"):
+            with self.assertRaises(logban.ConfigError, msg=text):
+                ConfigTest.load(self, "costly = x\n" + text)
 
 
 if __name__ == "__main__":
