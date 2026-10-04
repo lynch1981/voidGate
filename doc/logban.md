@@ -152,7 +152,7 @@ Config keys (`logban.conf` documents each one):
 | `honey`, `honey_ttl` | §5.6 |
 | `watch <name>`, `<name>.max`, `<name>.ratio`, `<name>.ttl` | §5.7 |
 | `cluster_min_addresses`, `cluster_min_costly`, `cluster_ratio`, `cluster_member_min` | §5.8 |
-| `allow`, `allow_file`, `skip`, `crawler` | §6 |
+| `allow`, `allow_file`, `skip`, `crawler`, `crawler_ua`, `crawler_timeout` | §6 |
 | `ttl`, `max_ttl`, `offense_memory` | §7.1 |
 | `socket` | §7.4 |
 | `json_ip`, `json_time`, `json_request`, `json_method`, `json_uri`, `json_status`, `json_ua`, `json_rt`, `json_urt`, `json_ja4` | §4.2 |
@@ -529,7 +529,7 @@ look like a botnet; keep `ttl` short.
 | `allow` | every line (cached) | CIDRs; `127.0.0.0/8` and `::1` always |
 | `allow_file` | every line (cached) | CIDR files, re-read when replaced |
 | `skip` | every line | path regexes: those requests are not judged; a `honey` path is checked first |
-| `crawler` | only when a rule fires | reverse DNS suffix, confirmed forward |
+| `crawler` | only when a rule fires, and only for a client that claimed a crawler's user agent | reverse DNS suffix, confirmed forward |
 
 ### 6.1 Allowlists are applied as lines are read
 
@@ -559,12 +559,33 @@ One CIDR per line, `#` comments, repeatable key.
 
 ### 6.3 Crawlers
 
-A user agent is free to forge, so it is never trusted. A client is a
+A user agent is free to forge, so it never exempts. A client is a
 crawler when its reverse DNS name ends in a `crawler` domain
 (`googlebot.com`, `search.msn.com`, ...) **and** that name resolves back
-to the same address. This is what the search engines document. DNS is
-slow, so it runs only for an address that already matched a rule, and
-the result is cached.
+to the same address. This is what the search engines document.
+
+DNS is slow, and a reverse zone may not answer at all, so the check is
+narrowed three ways:
+
+- **Only when a rule fires** (or a honey path is hit), and the result is
+  cached per address.
+- **Only for a client that claimed to be a crawler**: at least one of
+  its requests carried a user agent matching `crawler_ua` (default
+  `(?i)bot|crawl|spider|slurp|google`, which covers Googlebot, its
+  `Mediapartners-Google` and `Googlebot-Image`, Bingbot, Yandex, Apple,
+  Baidu). Real crawlers always say so. A scanner with a browser's user
+  agent is banned with no lookup; a fake Googlebot is looked up, fails,
+  and is banned. The match is cached per user agent string.
+- **Each lookup gets `crawler_timeout` seconds** (1), reverse and
+  forward each, in a thread; one that does not answer in time is "not a
+  crawler", and `-v` logs it.
+
+In follow mode a lookup holds up the loop, and with it every other
+client's bans. On the Kaggle log (§17.3), checking every candidate made
+142 lookups: 79 of the addresses have no reverse DNS, 16 lookups took
+over 1 s, up to 10 s each, 104 s in all, and the replay ran 531 s
+instead of 274. With the claim and the timeout: 12 lookups, 271 s, the
+same bans.
 
 ### 6.4 Skipped paths
 
@@ -774,6 +795,7 @@ stderr:
 | `skip <ip> allow\|crawler honey <path>` | with `-v`, an exempt client hit a honey path |
 | `skip <ip> allow\|crawler <watch> hits=N` | with `-v`, an exempt client reached a watch's `max` |
 | `skip <ip> allow\|crawler cluster` | with `-v`, an exempt member of a firing cluster |
+| `crawler check: <name> timed out after N s` | with `-v`, a lookup gave no answer within `crawler_timeout` (§6.3) |
 | `N lines, N unparsed, N allowed, N honey hits` | at the end of a replay, with `-v` or a `--top-*` report |
 
 `--review` prints its table and results on stdout instead of ban lines
@@ -866,8 +888,11 @@ The offense counts are kept for every address ever banned (§15).
   a fake `rt=` or address.
 - **Socket access.** Sending drops needs root or `ctl_socket_group`, and
   that grants the whole protocol (l7-bridge §11). Use `-n` while tuning.
-- **Crawler spoofing.** User agents are ignored; only forward-confirmed
-  reverse DNS exempts (§6.3).
+- **Crawler spoofing.** A user agent only decides whether DNS is asked;
+  only forward-confirmed reverse DNS exempts (§6.3).
+- **Slow reverse zones.** An attacker who runs the reverse DNS of its
+  addresses can make lookups hang. They are asked only for a client that
+  claims a crawler's user agent, and capped at `crawler_timeout` each.
 - **User agent spoofing.** A user agent only picks a profile's
   thresholds, and every profile must be able to ban (§5.4).
 - **JA4 spoofing.** Same rule: a copied fingerprint picks thresholds,
@@ -894,6 +919,7 @@ The offense counts are kept for every address ever banned (§15).
 | `allow_file` broken by an update | old networks kept, one warning |
 | `cdn_allow.py` fetch or check fails | exit 1, old file kept |
 | DNS down | crawler check fails closed: the client is banned like any other |
+| a reverse zone that never answers | given up after `crawler_timeout`, counted as not a crawler; the thread finishes on its own |
 | logban crashes or restarts | live drops expire by themselves; offense counts and the window start over |
 | nginx log buffering (`buffer=`, `flush=`) | bans later by the buffering delay |
 | clock jump, or replay gap | one judgment, then an empty window |
@@ -1008,6 +1034,7 @@ integration scripts.
 | `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
 | `Ja4Test` | `ja4=` parsed, `-` / empty / missing as none, `ja4t=` ignored; exact fingerprints held as a set, other `ja4:` as regexes, exact means exact; known stacks pass while a script with the app's user agent and a plain-HTTP client are banned by `api_other`; a copied fingerprint banned by `app.backend`; `--top-ja4` columns, share, banned count, commented paste lines that load once uncommented; no `ja4=` in the log; off unless asked |
 | `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; `throttled` on 429; OR lines and a status regex, `ttl`; spaces or tabs in `watch <name>` and `profile <name>`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved names (`honey`, `cluster`) and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
+| `CrawlerTest` | no lookup for clients with a browser's user agent; a fake Googlebot looked up and banned; one crawler request is enough to be checked later; a 2 s reverse zone given up after 0.2 s, three clients in under 1.5 s, logged with `-v`; the user agent cache, nothing tracked without a crawler list; `crawler_ua` default covers the usual crawlers and not a browser; config errors. Removing the timeout, or the claim, makes a test fail. |
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ExplainTest` | under, fires and BAN rows with their times, folded banned steps, summary; the same bans as a normal run; `under:` reasons (costly share, backend); allowlisted: never judged; verified crawler: exempt; honey, skipped, two profiles and a watch in one replay; watch ratio reason; not in the log; CLI: IPv6 normalized, the config's socket never used, bad address, refused with `-f` and `--review` |
 | `ClusterTest` | a 30-address botnet each under every threshold: no ban by per-address rules, all banned by the cluster, ban line with size, ja4 and ua; user agent alone without `ja4=`; 50 browsers on one stack pass; search-only users inside a browser cluster pass; a member that browses and one with 2 costly requests pass; below `cluster_min_addresses`, below `cluster_min_costly`, spread over 10 minutes; ratio-off profiles not clustered; allowlisted not counted, verified crawlers not banned; off by default; `--explain` rows; config bounds only when on. Each of the three safety conditions was removed in turn and a test failed. |
@@ -1029,7 +1056,8 @@ was asked 29 times.
 
 ## 17. Real logs
 
-`contrib/logban/data/` holds two nginx logs, replayed by `DataTest`.
+`contrib/logban/data/` holds two nginx logs, replayed by `DataTest`, and
+can hold a third, large one that is not in git (§17.3).
 
 ### 17.1 `me.access.log`
 
@@ -1077,3 +1105,45 @@ different address, one host, evenly spread methods and user agents. It
 checks JSON parsing at scale (every line parses; the reports equal those
 of the same lines converted to `combined`) and that a log with one
 request per address bans no one, clusters included.
+
+### 17.3 `kaggle.access.log`
+
+The Kaggle dataset "Web Server Access Logs": zanbil.ir, an e-commerce
+site, 22 to 26 Jan 2019. 3.5 GB, 10,365,152 lines from 258,606
+addresses, `combined` with a trailing `X-Forwarded-For`, no timing. Too
+big for git: `.gitignore` keeps it out, and no test replays it.
+
+- **Parsed whole**, at 87k lines/s; a full replay takes 4.5 minutes.
+- **Mostly real users.** 92 % of answers are 200, 1 % are 404, and the
+  most common 404s are harmless: AMP's
+  `amp_preconnect_polyfill_404_or_other_error_expected` (5,917
+  addresses) and iPhones' `apple-touch-icon*.png` (4,500).
+- **The busiest clients are crawlers and staff.** Google's crawlers
+  lead (one sent 353k requests and drew 10,865 404s). After them come
+  the shop's own staff polling the admin panel (`/rapidGrails/jsonList`,
+  `POST /orderAdministration/list`); one drew 11,165 500s.
+- **Few attackers.** `/wp-login.php` from 119 addresses on a site that
+  is not WordPress, and a product scraper on a hosting server
+  (`91.99.72.15`: 38,694 requests, all product pages, no images or
+  static files, a 2012 Chrome user agent).
+
+Config: costly `^/(m/)?(filter|search|browse)(/|$)` and `^/(m/)?product/`,
+honey for WordPress, `.env`, `.git` and phpMyAdmin paths, the 404 watch
+with `ratio = 0.5`, crawlers `googlebot.com`, `google.com`,
+`search.msn.com`, and the Cloudflare allowlist (some traffic came
+through Cloudflare).
+
+| | No DNS, no Cloudflare allowlist | Both |
+|---|---|---|
+| addresses banned | 154 | 142 |
+| Googlebot, Bingbot or Cloudflare edges among them | 1 Googlebot (17 bans), 5 Bingbot, 6 edges | none |
+| staff, or any address that loaded images or static files | 0 | 0 |
+| requests inside ban windows | 2.9 % | 0.03 % |
+
+The 142: 140 scanners by honey, one path scanner by the 404 watch, and
+the product scraper by the ratio rule. Staff were safe without any
+exemption: the admin paths are not costly, so their share is 0.
+
+Lessons: a crawler with a fast 404 rate needs the crawler check, which
+needs DNS; a site behind a CDN needs its allowlist, as in §17.1; and the
+crawler check needed the fixes of §6.3 to keep up.

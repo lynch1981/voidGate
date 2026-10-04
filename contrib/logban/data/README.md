@@ -4,6 +4,7 @@
 |---|---|
 | `me.access.log` | A real nginx log, `combined`, no timing fields: a small static site, 20 Sep - 4 Oct 2026, 34,946 lines, mostly scanners. |
 | `me.conf` | The logban config built for that site from that log. |
+| `kaggle.access.log` | Not in git (3.5 GB; `.gitignore` keeps it out): the Kaggle dataset "Web Server Access Logs", an e-commerce site, Jan 2019, 10.4M lines. Results in `doc/logban.md` section 17.3. |
 | `clickHouse.access.log` | Generated sample data in nginx JSON (`escape=json`): every line from a different address, one host (`example.com`), evenly spread methods and user agents. Useful to test JSON parsing; nothing in it should be banned. |
 
 Try them:

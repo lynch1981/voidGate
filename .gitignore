@@ -10,3 +10,5 @@ t/unit/cidr
 src/bpf/voidgate.bpf.o
 src/bpf/voidgate.skel.h
 src/bpf/vmlinux.h
+# 3.5 GB sample log, see contrib/logban/data/README.md
+contrib/logban/data/kaggle.access.log
