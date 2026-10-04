@@ -129,4 +129,5 @@ echo "allow_networks = 169.254.169.254/32, 127.0.0.0/8, ::1/128," \
 
 ```sh
 python3 contrib/logban/test_logban.py      # also run by make test
+sudo t/integration/logban.sh               # against a real daemon
 ```

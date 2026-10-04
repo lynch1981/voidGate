@@ -730,6 +730,10 @@ Future work:
 `python3 contrib/logban/test_logban.py`, also run by `make test`. No root,
 no daemon, about one second.
 
+`sudo t/integration/logban.sh` runs logban against a real daemon in
+private namespaces, about 10 s. Not part of `make test`, like the other
+integration scripts.
+
 | Test class | Covers |
 |---|---|
 | `ParseTest` | combined format, `urt` with several upstreams, `urt=-` falling back to `rt`, IPv6, timezones, garbage and malformed request lines |
@@ -745,6 +749,11 @@ no daemon, about one second.
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
-Not covered: a real daemon. logban sends the same line that `voidgatectl
-drop <ip> ttl=N` sends, which `t/drop-ttl.t` and `t/drop-ttl-xdp.t`
-cover.
+| `t/integration/logban.sh` | Covers |
+|---|---|
+| replay | ratio bans (IPv4 and IPv6) and a honey ban land as `reason=4` drops; a browser is not dropped; a flood from the protected `local_networks` address is asked once (one logban line with `retry_after=600s`, one `refuse drop` line in the daemon log), not every step |
+| follow | daemon stopped: a live flood's ban fails with `error=` and is retried every step; daemon started: the next retry lands the drop |
+
+That XDP then drops the address is `t/drop-ttl-xdp.t`'s job: logban sends
+the same `drop <ip> ttl=N` as `voidgatectl`. The test fails against the
+logban before this fix: the protected address was asked 29 times.
