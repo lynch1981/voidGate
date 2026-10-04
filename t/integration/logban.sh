@@ -1,9 +1,9 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 # Run contrib/logban against a real daemon in private namespaces. Replay:
-# rule and honey bans become timed drops, a browser is left alone, and a
-# drop the daemon refuses is asked once, not every step. Follow: bans that
-# fail while the daemon is down are retried until it is back.
+# rule, watch and honey bans become timed drops, a browser is left alone,
+# and a drop the daemon refuses is asked once, not every step. Follow:
+# bans that fail while the daemon is down are retried until it is back.
 set -euo pipefail
 
 . "$(dirname "$0")/../bin/create_env.sh"
@@ -70,6 +70,8 @@ start_daemon
 cat > "$lbconf" <<'EOF'
 costly = ^/search
 honey = ^/\.env
+watch scan = status:404
+scan.max = 50
 ttl = 600
 EOF
 
@@ -82,10 +84,10 @@ from datetime import datetime, timedelta, timezone
 t0 = datetime(2026, 10, 3, 10, 0, tzinfo=timezone.utc)
 out = []
 
-def emit(ip, sec, path):
+def emit(ip, sec, path, status=200):
     stamp = (t0 + timedelta(seconds=sec)).strftime("%d/%b/%Y:%H:%M:%S +0000")
-    out.append((sec, '%s - - [%s] "GET %s HTTP/1.1" 200 512 "-" "test"'
-                     ' rt=0.1 urt=0.1\n' % (ip, stamp, path)))
+    out.append((sec, '%s - - [%s] "GET %s HTTP/1.1" %d 512 "-" "test"'
+                     ' rt=0.1 urt=0.1\n' % (ip, stamp, path, status)))
 
 for i in range(150):
     emit("203.0.113.7", i * 0.2, "/search?q=%d" % i)
@@ -97,6 +99,9 @@ for i in range(1500):
 for i in range(200):
     emit("198.51.100.20", i * 0.2, "/search" if i % 4 == 0 else "/")
 emit("198.18.0.5", 12, "/.env")
+# a path scanner: 60 misses
+for i in range(60):
+    emit("198.18.0.6", i * 0.3, "/scan%d.php" % i, 404)
 
 out.sort(key=lambda x: x[0])
 open(sys.argv[1], "w").writelines(line for _, line in out)
@@ -110,10 +115,13 @@ echo "$drops"
 grep -Eq '^203\.0\.113\.7/32 reason=4 ' <<< "$drops"
 grep -Eq '^2001:db8::bad/128 reason=4 ' <<< "$drops"
 grep -Eq '^198\.18\.0\.5/32 reason=4 ' <<< "$drops"
+grep -Eq '^198\.18\.0\.6/32 reason=4 ' <<< "$drops"
 refute grep -q '198\.51\.100\.10' <<< "$drops"
 refute grep -q '198\.51\.100\.20' <<< "$drops"
 
 grep -q ' ban 198\.18\.0\.5 ttl=3600 .*rule=honey path=/\.env$' \
+    "$work/replay.out"
+grep -Eq ' ban 198\.18\.0\.6 ttl=600 .*rule=scan hits=[0-9]+$' \
     "$work/replay.out"
 # refused once, held for its ttl: one line from logban, one in the daemon
 [[ $(grep -c ' ban 198\.51\.100\.10 ' "$work/replay.out") == 1 ]]

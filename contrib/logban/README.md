@@ -15,6 +15,7 @@ Per address, over a 60 s sliding window judged every 10 s:
 | `ratio` | at least 100 costly requests, and at least 90 % of all its requests |
 | `backend` | at least `max_backend_seconds` of backend time (off by default) |
 | `honey` | one request to a path the site never serves, banned at once |
+| a watch | requests by method, path and status: 404 scans, failed logins, 429s |
 
 A request is costly if its path matches a `costly` regex, or its backend
 time is at least `slow_seconds`. A ban lasts 600 s and doubles for each
@@ -49,6 +50,18 @@ Honey paths catch scanners on their first probe:
 ```
 honey = ^/(wp-login\.php|xmlrpc\.php|\.env|\.git(/|$))
 honey_ttl = 3600                 # doubles on repeats
+```
+
+Watches count requests by method, path and status:
+
+```
+watch scan = status:404
+scan.max = 50
+scan.ratio = 0.5                 # 404s must be half its requests
+watch login = method:POST path:^/login$ status:401|403
+login.max = 20
+watch throttled = status:429     # set limit_req_status 429;
+throttled.max = 30
 ```
 
 ## Log format
@@ -97,7 +110,7 @@ One line per ban:
 ```
 
 `logban.conf` documents every key: thresholds, `costly`, `profile`,
-`honey`, `skip`, `allow`, `allow_file`, `crawler`, ttl.
+`honey`, `watch`, `skip`, `allow`, `allow_file`, `crawler`, ttl.
 
 ## Behind Cloudflare
 

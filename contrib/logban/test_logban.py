@@ -22,11 +22,12 @@ import logban  # noqa: E402
 T0 = datetime(2026, 10, 3, 10, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
-def line(ip, t, path, rt=None, urt=None, ua="Mozilla/5.0", ja4=None):
+def line(ip, t, path, rt=None, urt=None, ua="Mozilla/5.0", ja4=None,
+         method="GET", status=200):
     stamp = datetime.fromtimestamp(t, timezone.utc).strftime(
         "%d/%b/%Y:%H:%M:%S +0000")
-    s = '%s - - [%s] "GET %s HTTP/1.1" 200 512 "-" "%s"' % (
-        ip, stamp, path, ua)
+    s = '%s - - [%s] "%s %s HTTP/1.1" %d 512 "-" "%s"' % (
+        ip, stamp, method, path, status, ua)
 
     if rt is not None:
         s += " rt=%s urt=%s" % (rt, urt if urt is not None else "-")
@@ -98,7 +99,8 @@ class ParseTest(unittest.TestCase):
     def test_combined(self):
         self.assertEqual(logban.parse_line(
             line("203.0.113.7", T0, "/search?q=1")),
-            ("203.0.113.7", T0, "/search", None, "Mozilla/5.0", ""))
+            ("203.0.113.7", T0, "/search", None, "Mozilla/5.0", "", "GET",
+             "200"))
 
     def test_timing(self):
         self.assertEqual(logban.parse_line(
@@ -1176,6 +1178,186 @@ class HoneyTest(unittest.TestCase):
         # honey_ttl is only checked when there are honey paths
         cfg = ConfigTest.load(self, "costly = x\nmax_ttl = 600\n")
         self.assertEqual(cfg.honey, [])
+
+
+def watch_config(*lines):
+    cfg = logban.Config()
+
+    for ln in ("costly = ^/search",) + lines:
+        k, _, v = ln.partition("=")
+        cfg.set(k.strip(), v.strip())
+
+    cfg.check()
+    return cfg
+
+
+SCAN = ("watch scan = status:404", "scan.max = 50")
+LOGIN = ("watch login = method:POST path:^/login$ status:401|403",
+         "login.max = 20")
+THROTTLED = ("watch throttled = status:429", "throttled.max = 30")
+
+
+def hits(ip, n, path="/x", every=0.5, start=T0, **kw):
+    return [line(ip, start + i * every, path, **kw) for i in range(n)]
+
+
+class WatchTest(unittest.TestCase):
+
+    def test_parse(self):
+        r = logban.parse_line(line("::1", T0, "/login?next=/", method="POST",
+                                   status=401))
+        self.assertEqual((r[logban.F_METHOD], r[logban.F_PATH],
+                          r[logban.F_STATUS]), ("POST", "/login", "401"))
+
+        s = ('198.51.100.1 - - [03/Oct/2026:10:00:00 +0000] "\\x16\\x03"'
+             ' 400 0 "-" "-"\n')
+        r = logban.parse_line(s)
+        self.assertEqual(r[6:], ("", "400"))
+        self.assertEqual(r[logban.F_PATH], "")
+
+    def test_scan(self):
+        act, out, _ = run(watch_config(*SCAN), hits("203.0.113.7", 60,
+                                                    status=404))
+        self.assertEqual(act.calls, [("203.0.113.7", 600)])
+        # hits as counted at the judgment step
+        self.assertIn("total=60 costly=0 ratio=0.00 backend=0.0s rule=scan"
+                      " hits=60\n", out)
+
+        act, _, _ = run(watch_config(*SCAN), hits("203.0.113.7", 49,
+                                                  status=404))
+        self.assertEqual(act.calls, [])
+
+    def test_window_slides(self):
+        # 100 404s over 10 minutes: never 50 in 60 s
+        act, _, _ = run(watch_config(*SCAN), hits("203.0.113.7", 100,
+                                                  every=6, status=404))
+        self.assertEqual(act.calls, [])
+
+    def test_ratio(self):
+        # a NAT: 60 404s (missing images) among 600 pages
+        lines = merge(hits("100.64.0.1", 60, every=0.5, status=404),
+                      hits("100.64.0.1", 540, path="/", every=0.05))
+        act, _, _ = run(watch_config(*SCAN), lines)
+        self.assertEqual(len(act.calls), 1)
+
+        act, _, _ = run(watch_config(*SCAN, "scan.ratio = 0.5"), lines)
+        self.assertEqual(act.calls, [])
+
+        # a scanner: almost only 404s
+        lines = merge(hits("203.0.113.7", 60, status=404),
+                      hits("203.0.113.7", 5, path="/"))
+        act, out, _ = run(watch_config(*SCAN, "scan.ratio = 0.5"), lines)
+        self.assertEqual(len(act.calls), 1)
+        self.assertIn("total=65 ", out)
+        self.assertIn("rule=scan hits=60\n", out)
+
+    def test_login(self):
+        cfg = watch_config(*LOGIN)
+
+        act, out, _ = run(cfg, hits("203.0.113.7", 25, path="/login",
+                                    method="POST", status=401))
+        self.assertEqual(len(act.calls), 1)
+        self.assertRegex(out, r"rule=login hits=2\d\n")
+
+        # 403 counts too; GET, a 200, or another path do not
+        lines = (hits("203.0.113.8", 20, path="/login", method="POST",
+                      status=403))
+        self.assertEqual(len(run(cfg, lines)[0].calls), 1)
+
+        for kw in ({"method": "GET", "status": 401},
+                   {"method": "POST", "status": 200},
+                   {"method": "POST", "status": 422}):
+            lines = hits("203.0.113.9", 30, path="/login", **kw)
+            self.assertEqual(run(cfg, lines)[0].calls, [], kw)
+
+        lines = hits("203.0.113.9", 30, path="/login/help", method="POST",
+                     status=401)
+        self.assertEqual(run(cfg, lines)[0].calls, [])
+
+    def test_throttled(self):
+        # nginx limit_req answering 429: escalate to XDP
+        act, out, _ = run(watch_config(*THROTTLED),
+                          hits("203.0.113.7", 40, status=429))
+        self.assertEqual(len(act.calls), 1)
+        self.assertIn("rule=throttled", out)
+
+    def test_or_lines_and_regex(self):
+        cfg = watch_config("watch errors = status:5..",
+                           "watch errors = path:^/cgi-bin/",
+                           "errors.max = 10", "errors.ttl = 120")
+        lines = merge(hits("203.0.113.7", 5, status=502),
+                      hits("203.0.113.7", 5, path="/cgi-bin/x", start=T0 + 1))
+        act, _, _ = run(cfg, lines)
+        self.assertEqual(act.calls, [("203.0.113.7", 120)])
+
+    def test_not_counted(self):
+        # allowlisted and skipped requests never reach a watch
+        cfg = watch_config(*SCAN, "allow = 192.0.2.0/24", "skip = ^/static/")
+        lines = merge(hits("192.0.2.1", 60, status=404),
+                      hits("203.0.113.7", 60, path="/static/a.png",
+                           status=404))
+        act, _, judge = run(cfg, lines)
+        self.assertEqual(act.calls, [])
+        self.assertEqual(judge.watched.totals, {})
+
+    def test_crawler_exempt(self):
+        dns = {"66.249.66.1": (["crawl.googlebot.com"], set()),
+               "crawl.googlebot.com": ([], {"66.249.66.1"})}
+        cfg = watch_config(*SCAN, "crawler = googlebot.com")
+        act, _, _ = run(cfg, hits("66.249.66.1", 60, status=404),
+                        resolve=lambda n: dns.get(n, ([], set())))
+        self.assertEqual(act.calls, [])
+
+    def test_one_ban_clears_all(self):
+        # a scanner that also floods: one ban, every counter cleared
+        cfg = watch_config(*SCAN, *THROTTLED)
+        lines = merge(hits("203.0.113.7", 50, path="/search", every=0.4),
+                      hits("203.0.113.7", 50, status=404, every=0.4),
+                      hits("203.0.113.7", 30, status=429, every=0.4))
+        act, _, judge = run(cfg, lines)
+        self.assertEqual(len(act.calls), 1)
+        self.assertEqual(judge.win.totals, {})
+        self.assertEqual(judge.watched.totals, {})
+
+    def test_refused_held(self):
+        act = Recorder(fail=logban.Refused('"error: refused"'))
+        run(watch_config(*SCAN), hits("198.51.100.10", 600, every=0.2,
+                                      status=404), act=act)
+        self.assertEqual(len(act.calls), 1)
+
+    def test_config(self):
+        cfg = watch_config(*SCAN, *LOGIN, "scan.ratio = 0.5",
+                           "login.ttl = 3600")
+        scan, login = cfg.watches
+        self.assertEqual((scan.max, scan.ratio, scan.ttl), (50, 0.5, 600))
+        self.assertEqual((login.max, login.ratio, login.ttl), (20, None, 3600))
+        self.assertEqual(len(login.alts[0]), 3)
+
+        # watches alone, or honey alone, are a working config
+        ConfigTest.load(self, "watch scan = status:404\nscan.max = 9\n")
+        ConfigTest.load(self, "honey = ^/\\.env\n")
+
+    def test_config_errors(self):
+        for text in ("watch scan = status:404\n",                 # no max
+                     "watch scan = status:404\nscan.max = 0\n",
+                     "watch scan = code:404\nscan.max = 5\n",
+                     "watch scan = status\nscan.max = 5\n",
+                     "watch scan = status:(\nscan.max = 5\n",
+                     "watch honey = status:404\nhoney.max = 5\n",
+                     "watch Scan = status:404\n",
+                     "scan.max = 5\n",                             # undeclared
+                     "watch scan = status:404\nscan.max = 5\n"
+                     "scan.min_costly = 5\n",                    # profile key
+                     "profile api = ua:x\napi.max_backend_seconds = 5\n"
+                     "api.max = 5\n",                             # watch key
+                     "profile x = ua:x\nx.max_backend_seconds = 5\n"
+                     "watch x = status:404\nx.max = 5\n",        # both
+                     "watch scan = status:404\nscan.max = 5\n"
+                     "scan.ttl = 999999\n",
+                     "watch scan = status:404\nscan.max = 5\n"
+                     "scan.ratio = 2\n"):
+            with self.assertRaises(logban.ConfigError, msg=text):
+                ConfigTest.load(self, "costly = x\n" + text)
 
 
 if __name__ == "__main__":

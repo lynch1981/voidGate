@@ -51,6 +51,9 @@ NUMBER = re.compile(r'\d+(?:\.\d+)?')
 # ja4=t13d1516h2_8daaf6152771_02713d6af862; "-" or empty when the
 # connection had no TLS or the module did not run.
 JA4 = re.compile(r'\bja4=([0-9a-z_]+)')
+# Fields of a parsed line. A plain tuple: a namedtuple per line cost 20 %
+# of a replay.
+F_IP, F_T, F_PATH, F_COST, F_UA, F_JA4, F_METHOD, F_STATUS = range(8)
 
 
 class ConfigError(Exception):
@@ -182,6 +185,62 @@ class Profile:
                 or any(rx.search(values[i]) for i, rx in self.match))
 
 
+class Watch:
+    """Count the requests that match all of a line's conditions, per
+    address over the window; ban at max. Several lines with one name
+    OR."""
+
+    KEYS = {
+        "max": int,
+        "ratio": parse_ratio,
+        "ttl": int,
+    }
+    # path is searched like costly; method and status must match whole
+    FIELDS = {"method": F_METHOD, "path": F_PATH, "status": F_STATUS}
+
+    def __init__(self, name):
+        self.name = name
+        self.alts = []              # [(field index, match)], all match
+        self.keys = {}
+
+    def add(self, value):
+        conds = []
+
+        for word in value.split():
+            field, sep, rx = word.partition(":")
+
+            if not sep or field not in self.FIELDS or not rx:
+                raise ValueError("expected method:, path: or status:<regex>,"
+                                 " got %r" % word)
+
+            i = self.FIELDS[field]
+            rx = re.compile(rx)
+            conds.append((i, rx.search if i == F_PATH else rx.fullmatch))
+
+        if not conds:
+            raise ValueError("no condition")
+
+        # Most lines fail the first test: the 3-digit status, then the
+        # method, then the path.
+        order = (F_STATUS, F_METHOD, F_PATH)
+        conds.sort(key=lambda c: order.index(c[0]))
+        self.alts.append(conds)
+
+    def matches(self, r):
+        """r: a parse_line() tuple. Plain loops: this runs per line and
+        watch, and any(all(...)) cost a third of a replay."""
+
+        for conds in self.alts:
+            for i, match in conds:
+                if match(r[i]) is None:
+                    break
+
+            else:
+                return True
+
+        return False
+
+
 class Config:
 
     # key: (type, default); list keys may repeat.
@@ -199,6 +258,8 @@ class Config:
         "socket": (str, VG_SOCK_PATH),
     }
     LISTS = ("costly", "skip", "honey", "allow", "allow_file", "crawler")
+    # rule names a watch would be confused with
+    RESERVED = ("default", "ratio", "backend", "honey")
 
     def __init__(self):
         for key, (_, default) in self.SCALARS.items():
@@ -212,12 +273,20 @@ class Config:
         self.allow_files = AllowFiles()
         self.crawler = []
         self.profiles = [Profile("default")]
-        self.pending = []           # (profile, key, value) until check()
+        self.watches = []
+        self.pending = []           # (name, key, value) until check()
 
     def profile(self, name):
         for p in self.profiles:
             if p.name == name:
                 return p
+
+        return None
+
+    def watch(self, name):
+        for w in self.watches:
+            if w.name == name:
+                return w
 
         return None
 
@@ -279,9 +348,25 @@ class Config:
 
             p.add(field, rx)
 
-        elif "." in key and key.split(".", 1)[1] in Profile.KEYS:
+        elif key.startswith("watch "):
+            name = key[6:].strip()
+
+            if not Profile.NAME.fullmatch(name) or name in self.RESERVED:
+                raise ValueError("bad watch name %r" % name)
+
+            w = self.watch(name)
+
+            if w is None:
+                w = Watch(name)
+                self.watches.append(w)
+
+            w.add(value)
+
+        elif "." in key and (key.split(".", 1)[1] in Profile.KEYS
+                             or key.split(".", 1)[1] in Watch.KEYS):
             name, sub = key.split(".", 1)
-            self.pending.append((name, sub, Profile.KEYS[sub](value)))
+            parse = Profile.KEYS.get(sub) or Watch.KEYS[sub]
+            self.pending.append((name, sub, parse(value)))
 
         else:
             raise ValueError("unknown key")
@@ -307,13 +392,39 @@ class Config:
                                       % (rx.pattern, path or "an empty"
                                          " path"))
 
+        for p in self.profiles[1:]:
+            if self.watch(p.name):
+                raise ConfigError("%s is both a profile and a watch"
+                                  % p.name)
+
         for name, sub, value in self.pending:
-            p = self.profile(name)
+            target = self.profile(name) or self.watch(name)
 
-            if p is None:
-                raise ConfigError("%s.%s: no profile %s" % (name, sub, name))
+            if target is None:
+                raise ConfigError("%s.%s: no profile or watch %s"
+                                  % (name, sub, name))
 
-            p.keys[sub] = value
+            if sub not in target.KEYS:
+                raise ConfigError("%s.%s: not a %s key" % (name, sub,
+                                  type(target).__name__.lower()))
+
+            target.keys[sub] = value
+
+        for w in self.watches:
+            w.max = w.keys.get("max")
+            w.ratio = w.keys.get("ratio")
+            w.ttl = w.keys.get("ttl", self.ttl)
+
+            if w.max is None or w.max < 1:
+                raise ConfigError("watch %s: %s.max must be set, at least 1"
+                                  % (w.name, w.name))
+
+            if w.ratio is not None and not 0 < w.ratio <= 1:
+                raise ConfigError("%s.ratio must be in (0, 1] or off"
+                                  % w.name)
+
+            if not 1 <= w.ttl <= self.max_ttl:
+                raise ConfigError("need 1 <= %s.ttl <= max_ttl" % w.name)
 
         any_costly = self.costly or self.slow_seconds > 0
         fires = []
@@ -342,9 +453,10 @@ class Config:
 
             fires.append(fire)
 
-        if not any(fires):
+        if not any(fires) and not self.watches and not self.honey:
             raise ConfigError("nothing is costly: set costly, slow_seconds"
-                              " or max_backend_seconds")
+                              " or max_backend_seconds, or a watch or"
+                              " honey")
 
 
 _time_cache = {}
@@ -364,15 +476,16 @@ def parse_time(s):
 
 
 def parse_line(line):
-    """Return (ip, epoch, path, backend_seconds or None, user agent,
-    ja4 or ""), or None."""
+    """Return (ip, epoch, path, cost, user agent, ja4, method, status):
+    cost is backend seconds or None; user agent, ja4 and method are ""
+    when absent. None when the line does not parse."""
 
     m = LINE.match(line)
 
     if m is None:
         return None
 
-    ip, stamp, request, _, ua, rest = m.groups()
+    ip, stamp, request, status, ua, rest = m.groups()
 
     try:
         t = parse_time(stamp)
@@ -381,7 +494,12 @@ def parse_line(line):
         return None
 
     parts = request.split(" ")
-    path = parts[1].split("?", 1)[0] if len(parts) == 3 else ""
+
+    if len(parts) == 3:
+        method, path = parts[0], parts[1].split("?", 1)[0]
+
+    else:
+        method, path = "", ""
 
     timing = dict(TIMING.findall(rest))
     cost = None
@@ -401,7 +519,7 @@ def parse_line(line):
         m = JA4.search(rest)
         ja4 = m.group(1) if m else ""
 
-    return ip, t, path, cost, ua or "", ja4
+    return ip, t, path, cost, ua or "", ja4, method, status
 
 
 class Window:
@@ -464,6 +582,8 @@ class Judge:
         self.verbose = verbose
         self.resolve = resolve or resolve_dns
         self.win = Window(cfg.step, cfg.window // cfg.step)
+        # (address, watch) -> [hits, 0, 0], moved with self.win
+        self.watched = Window(cfg.step, cfg.window // cfg.step)
         self.banned = {}            # ip -> until
         self.offenses = {}          # ip -> (count, last)
         self.listed = {}            # ip -> "allow", "bad-address" or ""
@@ -485,7 +605,7 @@ class Judge:
             self.skipped += 1
             return
 
-        ip, t, path, cost, ua, ja4 = r
+        ip, t, path, cost, ua, ja4, _, _ = r
         self.lines += 1
         self.clock(t)
 
@@ -522,6 +642,11 @@ class Judge:
         key = (ip, self.profile_of((path, ua, ja4))
                    if len(self.cfg.profiles) > 1 else 0)
         self.win.add(key, int(costly), cost or 0.0)
+
+        if self.cfg.watches:
+            for i, w in enumerate(self.cfg.watches):
+                if w.matches(r):
+                    self.watched.add((ip, i), 0, 0.0)
 
         if self.peaks is not None:
             pk = self.peaks.get(key)
@@ -566,6 +691,7 @@ class Judge:
         if win.cur is None:
             win.cur = idx
             win.reset()
+            self.watched.reset()
             return
 
         if idx <= win.cur:
@@ -575,6 +701,7 @@ class Judge:
             # A gap longer than the window: judge once, start over.
             self.judge((win.cur + 1) * self.cfg.step)
             win.reset()
+            self.watched.reset()
             win.cur = idx
             return
 
@@ -582,6 +709,7 @@ class Judge:
             win.cur += 1
             self.judge(win.cur * self.cfg.step)
             win.push()
+            self.watched.push()
 
     def finish(self):
         """Judge the partial window at end of input."""
@@ -628,6 +756,45 @@ class Judge:
                 continue
 
             self.ban(ip, now, rule, total, costly, cost)
+
+        if self.watched.totals:
+            self.judge_watches(now)
+
+    def judge_watches(self, now):
+        cfg = self.cfg
+        totals = None
+
+        for (ip, wi), (hits, _, _) in list(self.watched.totals.items()):
+            w = cfg.watches[wi]
+
+            if hits < w.max:
+                continue
+
+            if totals is None:
+                # all of each address's requests in the window, for ratio
+                totals = collections.Counter()
+
+                for (addr, _), st in self.win.totals.items():
+                    totals[addr] += st[0]
+
+            total = totals[ip] or hits
+
+            if w.ratio is not None and hits < w.ratio * total:
+                continue
+
+            if self.banned.get(ip, 0) > now:
+                continue
+
+            why = self.exempt_reason(ip)
+
+            if why:
+                if self.verbose:
+                    self.log("skip %s %s %s hits=%d" % (ip, why, w.name,
+                                                        hits))
+                continue
+
+            self.ban(ip, now, w.name, total, 0, 0.0, base=w.ttl,
+                     note=" hits=%d" % hits)
 
     def honey(self, ip, now, path):
         self.honey_hits += 1
@@ -681,6 +848,7 @@ class Judge:
         self.banned[ip] = now + ttl
 
         self.win.remove([(ip, i) for i in range(len(cfg.profiles))])
+        self.watched.remove([(ip, i) for i in range(len(cfg.watches))])
 
         if len(self.banned) > 65536:
             self.banned = {k: v for k, v in self.banned.items() if v > now}

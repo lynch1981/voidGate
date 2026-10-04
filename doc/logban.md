@@ -48,6 +48,8 @@ In scope:
   this format.
 - **Per-address rules** over a sliding window, with timed drops through
   the existing `drop <ip> ttl=<sec>` (l7-bridge §4).
+- **Watches**: per-address counts of requests by method, path and status
+  (404 scans, failed logins, `limit_req` 429s), §5.7.
 - **Profiles** by path, user agent or JA4 TLS fingerprint, each with its
   own thresholds (§5.4, §5.5).
 - **Replay**, to tune thresholds on old logs, **review**, to ban only
@@ -86,9 +88,10 @@ refused.
  │                     ▼                                          │
  │  profile: path / ua / ja4 (§5.4)                               │
  │  Window: per (address, profile) [total, costly, backend s]     │
+ │  and per (address, watch) [hits] (§5.7)                        │
  │                     │ every step (10 s, over 60 s)             │
  │                     ▼                                          │
- │  Judge: rule ratio | rule backend ──▶ crawler? (DNS, §6.3)      │
+ │  Judge: ratio | backend | watch ──▶ crawler? (DNS, §6.3)        │
  │                     │                                          │
  │                     ▼                                          │
  │  ban: ttl × 2^offense ──▶ stdout line ──▶ socket (unless -n)   │
@@ -137,7 +140,8 @@ from its README), append the fingerprint too:
 |---|---|
 | first word | the address that is judged and banned. It **must be the TCP peer** (§8). |
 | `$time_local` | window time, timezone included, so replays are exact |
-| `$request` | the path, without its query string; a malformed request line gives an empty path, still counted |
+| `$request` | the method and the path, without its query string; a malformed request line gives an empty method and path, still counted |
+| `$status` | watches (§5.7) |
 | `$http_user_agent` | profile matching only (§5.4); never trusted to exempt |
 | `urt=` | backend seconds: the sum of every upstream tried (`0.5, 0.2 : 0.1`) |
 | `rt=` | used when `urt` is `-` (nginx answered itself) |
@@ -195,6 +199,7 @@ to see which paths cost the most backend time.
 | `ratio` | `costly >= min_costly` (100) **and** `costly / total >= ratio` (0.9; `off` turns it off) | bots looping on costly URLs |
 | `backend` | backend seconds `>= max_backend_seconds` (0 = off) | a client heavy on the backend whatever it requests |
 | `honey` | one request to a `honey` path (§5.6) | scanners probing for `.env`, `.git`, admin panels |
+| a watch's name | `<name>.max` requests matching the watch, and optionally `<name>.ratio` of the address's requests (§5.7) | path scans, failed logins, clients nginx is already throttling |
 
 `min_costly` stops a short browsing burst from tripping the ratio. The
 ratio is what lets CGNAT and office addresses pass: many users behind
@@ -332,7 +337,54 @@ link meant as a trap must be `rel="nofollow"` and `Disallow`ed in
 `robots.txt`, so well-behaved crawlers stay out. Let nginx answer 404 for
 honey paths, so the app never serves them.
 
-## 6. Exemptions
+### 5.7 Watches
+
+The status is the server's verdict on a request, and some verdicts in
+bulk give a client away. A watch counts, per address over the window,
+the requests that match all of its conditions, and bans at `max`:
+
+```
+watch scan = status:404                       # path scanning
+scan.max = 50
+scan.ratio = 0.5
+
+watch login = method:POST path:^/login$ status:401|403
+login.max = 20                                # credential stuffing
+login.ttl = 3600
+
+watch throttled = status:429                  # limit_req said no
+throttled.max = 30
+```
+
+- **Conditions** are `method:`, `path:` and `status:` regexes, separated
+  by spaces, all of which must match. `path` is searched, like `costly`;
+  `method` and `status` must match whole, so `status:4..` is any 4xx and
+  `status:40` matches nothing. Several lines with one name OR.
+- **`<name>.max`** (required) hits in the window ban the address,
+  `rule=<name> hits=N`. **`<name>.ttl`** starts its ttl (default `ttl`),
+  doubled per offense as usual.
+- **`<name>.ratio`** (optional) also requires the hits to be that share
+  of all the address's requests in the window. A page with a few missing
+  images makes every visit a few 404s, and a NAT address with hundreds
+  of visitors reaches 50 of them; a scanner's requests are almost all
+  misses. With `scan.ratio = 0.5`, the NAT passes and the scanner does
+  not.
+- **What is counted:** the same requests as the window. Honey paths are
+  checked first, skipped paths and allowlisted addresses are not
+  counted, and a verified crawler is not banned. Watches count apart
+  from profiles: a profile's thresholds do not change a watch.
+- Names follow profile names, must differ from them, and cannot be
+  `default`, `ratio`, `backend` or `honey`.
+
+Notes for the three examples:
+
+| Watch | Note |
+|---|---|
+| `scan` | Fill `honey` first: it bans on one probe. `scan` catches the paths nobody listed. Keep the ratio: broken links are common. |
+| `login` | Only works if the app answers a failed login with 401, 403 or 422. Many answer 200 with an error page, or 302 back to the form, the same as a success; then the log cannot tell, and the app must rate-limit itself. |
+| `throttled` | `limit_req` answers **503** unless `limit_req_status 429;` is set; match what your config sends. The client is already refused by nginx; this moves it to XDP, so its requests stop costing a TLS handshake and a parse. |
+
+A watch has no profile or JA4 condition: add one if a case needs it.
 
 ## 6. Exemptions
 
@@ -600,6 +652,8 @@ browsers, a CGNAT address and 15 bots.
 | bans | all 15 bots, each about 30 s into its attack; no browser, no CGNAT |
 | allowlist filter (§6.1) | about 8 % of that time |
 | one `ua:` profile (§5.4) | about 20 % more: a regex on every line |
+| no watches | no cost |
+| three watches (§5.7) | about 15 % more |
 | `--top-clients` | about 30 % more: peaks updated every step |
 | a log without `ja4=` | no cost: the field is searched only when present |
 
@@ -677,6 +731,14 @@ The offense counts are kept for every address ever banned (§15).
 - **Honey paths only in nginx** (the OpenResty example's `ban_now()`).
   Faster, at the request itself, but it needs Lua. logban gives plain
   nginx the same trap; with OpenResty, both can run.
+- **fail2ban for the status cases.** Its nginx jails are regexes on the
+  log with a count over a time window, which is what a watch is. A watch
+  shares logban's window, allowlists, crawler check, refusal handling and
+  offense count, and needs no second daemon; l7-bridge §14 has why
+  fail2ban was not a decider.
+- **Separate rules per case** (`scan_404 = 50`, `login_fail = 20`).
+  Every site's login path and failure status differ; one generic shape
+  covers them, and the next case, without code.
 - **A hit count for honey paths** (ban on the 3rd). A real user never
   sends even one, and scanners send dozens: one is enough.
 - **A hard JA4 allowlist** (block every other fingerprint). Blocks
@@ -745,13 +807,14 @@ integration scripts.
 | `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked |
 | `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
 | `Ja4Test` | `ja4=` parsed, `-` / empty / missing as none, `ja4t=` ignored; exact fingerprints held as a set, other `ja4:` as regexes, exact means exact; known stacks pass while a script with the app's user agent and a plain-HTTP client are banned by `api_other`; a copied fingerprint banned by `app.backend`; `--top-ja4` columns, share, banned count, commented paste lines that load once uncommented; no `ja4=` in the log; off unless asked |
+| `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; `throttled` on 429; OR lines and a status regex, `ttl`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
 | `t/integration/logban.sh` | Covers |
 |---|---|
-| replay | ratio bans (IPv4 and IPv6) and a honey ban land as `reason=4` drops; a browser is not dropped; a flood from the protected `local_networks` address is asked once (one logban line with `retry_after=600s`, one `refuse drop` line in the daemon log), not every step |
+| replay | ratio bans (IPv4 and IPv6), a honey ban and a `scan` watch ban land as `reason=4` drops; a browser is not dropped; a flood from the protected `local_networks` address is asked once (one logban line with `retry_after=600s`, one `refuse drop` line in the daemon log), not every step |
 | follow | daemon stopped: a live flood's ban fails with `error=` and is retried every step; daemon started: the next retry lands the drop |
 
 That XDP then drops the address is `t/drop-ttl-xdp.t`'s job: logban sends
