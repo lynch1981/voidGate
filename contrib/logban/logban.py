@@ -317,7 +317,7 @@ class Config:
     LISTS = ("costly", "skip", "honey", "allow", "allow_file", "crawler")
     NAMED = re.compile(r"(profile|watch)\s+(\S.*)")
     # rule names a watch would be confused with
-    RESERVED = ("default", "ratio", "backend", "honey")
+    RESERVED = ("default", "ratio", "backend", "honey", "cluster")
 
     def __init__(self):
         for key, (_, default) in self.SCALARS.items():

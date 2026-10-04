@@ -1364,6 +1364,7 @@ class WatchTest(unittest.TestCase):
                      "watch scan = status\nscan.max = 5\n",
                      "watch scan = status:(\nscan.max = 5\n",
                      "watch honey = status:404\nhoney.max = 5\n",
+                     "watch cluster = status:404\ncluster.max = 5\n",
                      "watch Scan = status:404\n",
                      "scan.max = 5\n",                             # undeclared
                      "watch scan = status:404\nscan.max = 5\n"
