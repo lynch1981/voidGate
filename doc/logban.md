@@ -44,9 +44,9 @@ live log, and drop the offenders at XDP for a while.
 
 In scope:
 
-- **nginx access logs**, in `combined` format optionally followed by the
-  `rt=` and `urt=` timing fields. Kong and APISIX logs work when they use
-  this format.
+- **nginx access logs**: `combined`, optionally followed by `rt=`,
+  `urt=` and `ja4=` fields, or JSON lines (`escape=json`), §4. Kong and
+  APISIX logs work when they use either.
 - **Per-address rules** over a sliding window, with timed drops through
   the existing `drop <ip> ttl=<sec>` (l7-bridge §4).
 - **Watches**: per-address counts of requests by method, path and status
@@ -56,8 +56,11 @@ In scope:
   requests, §5.8.
 - **Profiles** by path, user agent or JA4 TLS fingerprint, each with its
   own thresholds (§5.4, §5.5).
+- **Honey paths**: one request to a path the site never serves bans
+  (§5.6).
 - **Replay**, to tune thresholds on old logs, **review**, to ban only
-  what a person confirms, and **follow**, to enforce live.
+  what a person confirms, **explain**, to show why an address was or
+  was not banned, and **follow**, to enforce live (§7).
 - **A CDN in front:** its edges are never banned (§8).
 
 Out of scope:
@@ -82,6 +85,7 @@ refused.
  │ logban.py                                                      │
  │                                                                │
  │  parse_line ──▶ honey path? ──yes──▶ exempt? ──no──▶ ban now   │
+ │  (combined or JSON, §4)                                        │
  │                     │ no                          (§5.6)       │
  │                     ▼                                          │
  │                 skip path? ──▶ path report (--top-paths)       │
@@ -117,8 +121,45 @@ Files, all in `contrib/logban/`:
 | `logban.py` | the decider; one file, Python 3.8+, standard library only |
 | `logban.conf` | example config, every key documented |
 | `cdn_allow.py` | fetches a CDN's egress ranges into an `allow_file` |
-| `test_logban.py` | unit tests for both scripts; no root, no daemon |
+| `test_logban.py` | unit tests for both scripts, and replays of `data/`; no root, no daemon |
 | `README.md` | how to run it |
+| `data/` | two nginx logs, a config built for one of them, and their README (§17) |
+
+`t/integration/logban.sh` runs logban against a real daemon (§16).
+
+Command line, `logban.py [options] LOG...`:
+
+| Option | Does |
+|---|---|
+| `-c`, `--config FILE` | config (`key = value`; without one, the defaults and nothing costly: an error) |
+| `-n`, `--dry-run` | print bans, send nothing |
+| `-f`, `--follow` | follow one log, like `tail -F` (§4.3); `--from-start` reads it whole first |
+| `-r`, `--review` | replay, list, ban what you pick (§7.3); not with `-f` |
+| `-x`, `--explain IP` | explain one address (§7.5); a dry run; not with `-f` or `-r` |
+| `--top-paths N`, `--top-clients N`, `--top-ja4 N` | reports at the end of a replay (§10) |
+| `-v`, `--verbose` | exempt clients that matched a rule, and the summary line |
+
+`LOG` may be `.gz` or `-` (stdin); several are read in order.
+
+Config keys (`logban.conf` documents each one):
+
+| Keys | Section |
+|---|---|
+| `window`, `step` | §5.1 |
+| `costly`, `slow_seconds` | §5.2 |
+| `min_costly`, `ratio`, `max_backend_seconds` | §5.3 |
+| `profile <name>`, `<name>.min_costly`, `<name>.ratio`, `<name>.max_backend_seconds` | §5.4, §5.5 |
+| `honey`, `honey_ttl` | §5.6 |
+| `watch <name>`, `<name>.max`, `<name>.ratio`, `<name>.ttl` | §5.7 |
+| `cluster_min_addresses`, `cluster_min_costly`, `cluster_ratio`, `cluster_member_min` | §5.8 |
+| `allow`, `allow_file`, `skip`, `crawler` | §6 |
+| `ttl`, `max_ttl`, `offense_memory` | §7.1 |
+| `socket` | §7.4 |
+| `json_ip`, `json_time`, `json_request`, `json_method`, `json_uri`, `json_status`, `json_ua`, `json_rt`, `json_urt`, `json_ja4` | §4.2 |
+
+`costly`, `honey`, `skip`, `allow`, `allow_file`, `crawler`, `profile`
+and `watch` may repeat. In `profile <name>` and `watch <name>`, spaces or
+tabs separate the two words.
 
 ## 4. Input
 
@@ -204,8 +245,10 @@ both give the same bans, and the sample `data/clickHouse.access.log`
 
 ### 5.1 Window
 
-Per address, a running `[total, costly, backend seconds]` over the last
-`window` seconds, kept as `window / step` buckets:
+Per (address, profile), a running `[total, costly, backend seconds]`
+over the last `window` seconds, kept as `window / step` buckets. Watches
+(§5.7) and fingerprint clusters (§5.8) keep windows of their own, moved
+in step with this one:
 
 - each line adds to the newest bucket and to the running totals;
 - at each step boundary the window is **judged**, then the oldest
@@ -415,7 +458,8 @@ throttled.max = 30
   counted, and a verified crawler is not banned. Watches count apart
   from profiles: a profile's thresholds do not change a watch.
 - Names follow profile names, must differ from them, and cannot be
-  `default`, `ratio`, `backend` or `honey`.
+  `default`, `ratio`, `backend`, `honey` or `cluster`: the rule names a
+  ban line could confuse them with.
 
 Notes for the three examples:
 
@@ -544,8 +588,10 @@ and a returning bot pays more each time.
 
 ### 7.2 After a ban
 
-- The address's counts are removed from the window, so an expired ban
-  does not fire again on old traffic.
+- The address's counts are removed from its profile and watch windows,
+  so an expired ban does not fire again on old traffic. Its cluster
+  counts stay: they only matter summed over many addresses, and are gone
+  one window later, long before the ttl ends.
 - It is not judged again until its ttl has passed. In a replay the bot's
   lines keep coming (nothing really dropped them), so expect a second ban
   with a doubled ttl. Live, its packets are dropped at XDP and it
@@ -604,7 +650,8 @@ as is:
 
 `--explain IP` (`-x`) answers "why was this address banned", or "why
 not", from the logs: a replay as a dry run (nothing is sent, whatever
-the config's socket) that prints only that address.
+the config's socket) that prints only that address. Not with `-f` or
+`-r`.
 
 ```
 explain 203.0.113.1: 60 s window, judged every 10 s; times are window ends, UTC
@@ -725,6 +772,8 @@ stderr:
 | `allow_file not reloaded, keeping N networks: ...` | the change did not parse |
 | `skip <ip> crawler\|allow total=N costly=N` | with `-v`, a verified crawler, or an address allowlisted mid-window (§6.2), matched a rule |
 | `skip <ip> allow\|crawler honey <path>` | with `-v`, an exempt client hit a honey path |
+| `skip <ip> allow\|crawler <watch> hits=N` | with `-v`, an exempt client reached a watch's `max` |
+| `skip <ip> allow\|crawler cluster` | with `-v`, an exempt member of a firing cluster |
 | `N lines, N unparsed, N allowed, N honey hits` | at the end of a replay, with `-v` or a `--top-*` report |
 
 `--review` prints its table and results on stdout instead of ban lines
@@ -773,17 +822,19 @@ row 1 is spread over 201. Requests without a fingerprint show as
 Peaks are sampled at each judgment step. Allowlisted addresses are not
 judged, so they are not listed. In a replay a banned client keeps
 sending (§7.2), so its peak can be higher than at its ban. Without timing
-fields both are by requests. Both reports are printed at the end of a
-replay; a follow run does not end, so it prints neither.
+fields both are by requests. The `--top-*` reports are printed at the
+end of a replay; a follow run does not end, so it prints none (§15).
 
 ## 11. Performance
 
 One core, CPython 3.12, synthetic log of one hour: 339k lines from 3000
-browsers, a CGNAT address and 15 bots.
+browsers, a CGNAT address and 15 bots. On the two-core VM used, repeated
+runs differ by up to 10 %; the "more" rows were measured against the
+version before each feature.
 
 | | |
 |---|---|
-| replay | 5.5 s, about 60k lines/s |
+| replay | 6.3 to 6.9 s, about 50k lines/s; 5.5 s with the first version, before profiles, honey, watches, explain and clusters each added a little |
 | parsing alone, a log with a new second on most lines (`data/`) | `combined` 83k lines/s, JSON 46k lines/s |
 | bans | all 15 bots, each about 30 s into its attack; no browser, no CGNAT |
 | allowlist filter (§6.1) | about 8 % of that time |
@@ -836,6 +887,7 @@ The offense counts are kept for every address ever banned (§15).
 | daemon down, or socket not reachable | each ban printed with `error=`, retried every step until it succeeds |
 | daemon refuses (address in `local_*` / `allow_*`, drop list full, map write failed) | printed once with `retry_after=`, held for the ttl, then judged again (§7.2) |
 | honey ban fails | printed with `error=`; the scanner's next probe tries again |
+| a line that does not parse (`combined` or JSON) | counted as unparsed, skipped |
 | log rotated | follow reopens the new file; window and bans kept |
 | log deleted | follow waits for it to reappear |
 | `allow_file` missing or broken at startup | exit 1 with file and line |
@@ -903,7 +955,7 @@ The offense counts are kept for every address ever banned (§15).
   loop, and a failure mode in every start. A separate cron job with
   atomic replace keeps logban offline.
 - **A Python client library** (like `resty.voidgate`). Deferred: logban
-  is its only Python user, and its socket code is one 30-line function.
+  is its only Python user, and its socket code is one short function.
   Worth it with a second Python decider, such as a CDN-API action.
 - **awk.** Smaller, but sliding windows, ttl escalation, allowlist
   reloads and tests are awkward in it.
@@ -931,11 +983,14 @@ Future work:
 - **Persisting offense counts** across restarts, and pruning them after
   `offense_memory` (today they live as long as the process).
 - **A systemd unit** for follow mode.
+- **`--top-*` reports in follow mode**, on a signal: today a follow run
+  prints none.
+- **Syslog-prefixed JSON**: a prefix before the `{` is not stripped.
 
 ## 16. Tests
 
 `python3 contrib/logban/test_logban.py`, also run by `make test`. No root,
-no daemon, about one second.
+no daemon, about 5 s, most of it `DataTest` replaying the real log.
 
 `sudo t/integration/logban.sh` runs logban against a real daemon in
 private namespaces, about 10 s. Not part of `make test`, like the other
@@ -952,7 +1007,7 @@ integration scripts.
 | `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked |
 | `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
 | `Ja4Test` | `ja4=` parsed, `-` / empty / missing as none, `ja4t=` ignored; exact fingerprints held as a set, other `ja4:` as regexes, exact means exact; known stacks pass while a script with the app's user agent and a plain-HTTP client are banned by `api_other`; a copied fingerprint banned by `app.backend`; `--top-ja4` columns, share, banned count, commented paste lines that load once uncommented; no `ja4=` in the log; off unless asked |
-| `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; `throttled` on 429; OR lines and a status regex, `ttl`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
+| `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; `throttled` on 429; OR lines and a status regex, `ttl`; spaces or tabs in `watch <name>` and `profile <name>`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved names (`honey`, `cluster`) and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ExplainTest` | under, fires and BAN rows with their times, folded banned steps, summary; the same bans as a normal run; `under:` reasons (costly share, backend); allowlisted: never judged; verified crawler: exempt; honey, skipped, two profiles and a watch in one replay; watch ratio reason; not in the log; CLI: IPv6 normalized, the config's socket never used, bad address, refused with `-f` and `--review` |
 | `ClusterTest` | a 30-address botnet each under every threshold: no ban by per-address rules, all banned by the cluster, ban line with size, ja4 and ua; user agent alone without `ja4=`; 50 browsers on one stack pass; search-only users inside a browser cluster pass; a member that browses and one with 2 costly requests pass; below `cluster_min_addresses`, below `cluster_min_costly`, spread over 10 minutes; ratio-off profiles not clustered; allowlisted not counted, verified crawlers not banned; off by default; `--explain` rows; config bounds only when on. Each of the three safety conditions was removed in turn and a test failed. |
@@ -968,8 +1023,9 @@ integration scripts.
 | follow | daemon stopped: a live flood's ban fails with `error=` and is retried every step; daemon started: the next retry lands the drop |
 
 That XDP then drops the address is `t/drop-ttl-xdp.t`'s job: logban sends
-the same `drop <ip> ttl=N` as `voidgatectl`. The test fails against the
-logban before this fix: the protected address was asked 29 times.
+the same `drop <ip> ttl=N` as `voidgatectl`. Against the logban from
+before refusals were held (§7.2), the test fails: the protected address
+was asked 29 times.
 
 ## 17. Real logs
 
