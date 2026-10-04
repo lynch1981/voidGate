@@ -375,6 +375,9 @@ The socket is created `0660 root:root`. The `ctl_socket_group` config key
 | Kong | `kong` | `nginx_user` in `kong.conf` |
 | APISIX | `nogroup` or `nobody`; `apisix` in its Docker image | `nginx_config.user` in `config.yaml` |
 
+The table assumes a master started as root, which drops its workers to the
+`user` directive. A master started as an ordinary user ignores `user` and
+runs its workers as itself, so `ctl_socket_group` is that user's group.
 Check the real group with `ps -eo user,group,args | grep 'worker process'`.
 In a container with the socket bind-mounted, the worker's numeric gid must
 match the host group's.

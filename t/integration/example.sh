@@ -20,6 +20,15 @@ if [[ -z $nginx ]]; then
     exit 0
 fi
 
+# refute <cmd...>: fail if cmd succeeds. Not "! cmd": set -e ignores a
+# negated command, so "! grep ..." can never fail the script.
+refute() {
+    if "$@"; then
+        echo "${0##*/}: unexpectedly true: $*" >&2
+        return 1
+    fi
+}
+
 cleanup() {
     local result=$?
     trap - EXIT
@@ -149,7 +158,7 @@ for i in $(seq 9); do
     [[ $(code 198.18.1.2 -d 'u=a&p=b' "$url/login") == 401 ]]
 done
 sleep 0.3
-! listed 198.18.1.2
+refute listed 198.18.1.2
 [[ $(code 198.18.1.2 -d 'u=a&p=b' "$url/login") == 401 ]]
 wait_listed 198.18.1.2
 
@@ -167,6 +176,13 @@ status=$(curl -sS "$url/voidgate/status")
 grep -q '^198.18.1.1/32 reason=4 ' <<< "$status"
 [[ $(code 198.18.1.9 "$url/voidgate/status") == 403 ]]
 
-! grep -q 'failed to run\|\[alert\]\|\[crit\]' "$prefix/error.log"
+refute grep -q 'failed to run\|\[alert\]\|\[crit\]' "$prefix/error.log"
+
+# Daemon gone: the honeypot still answers 403 and logs which ban failed,
+# once. (nginx's own "[crit] connect() ... failed" line comes from its core
+# connect code and is not ours to assert.)
+"$root/voidgate" -s stop -c "$conf"
+[[ $(code 198.18.1.4 "$url/wp-login.php") == 403 ]]
+[[ $(grep -c 'voidgate ban_now 198.18.1.4: ' "$prefix/error.log") == 1 ]]
 
 echo "openresty example tests passed"

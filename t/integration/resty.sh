@@ -18,6 +18,15 @@ if [[ -z $nginx ]]; then
     exit 0
 fi
 
+# refute <cmd...>: fail if cmd succeeds. Not "! cmd": set -e ignores a
+# negated command, so "! grep ..." can never fail the script.
+refute() {
+    if "$@"; then
+        echo "${0##*/}: unexpectedly true: $*" >&2
+        return 1
+    fi
+}
+
 cleanup() {
     local result=$?
     trap - EXIT
@@ -149,8 +158,14 @@ sleep 0.2
 grep -q 'ban: bad ip' "$prefix/error.log"
 grep -q 'ban_now from log: nil no cosocket in this phase, use ban()' \
     "$prefix/error.log"
-! grep -q 'failed to run log_by_lua' "$prefix/error.log"
-! "$root/voidgatectl" drops | grep -q '198.18.0.30/32'
-! grep -q '\[alert\]\|\[crit\]' "$prefix/error.log"
+refute grep -q 'failed to run log_by_lua' "$prefix/error.log"
+drops=$("$root/voidgatectl" drops)
+refute grep -q '198.18.0.30/32' <<< "$drops"
+# The "missing socket" check in resty.lua makes nginx's core log a [crit]
+# connect() failure; anything else at crit or alert is a bug.
+grep '\[alert\]\|\[crit\]' "$prefix/error.log" \
+    | grep -v 'connect() to unix:/run/voidgate.sock.missing failed' \
+    > "$work/unexpected.log" || true
+[[ ! -s $work/unexpected.log ]] || { cat "$work/unexpected.log" >&2; exit 1; }
 
 echo "resty client tests passed"

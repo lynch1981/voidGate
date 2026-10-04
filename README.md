@@ -122,6 +122,11 @@ config to the workers' group and restart voidgate. The daemon then creates
 ctl_socket_group = kong
 ```
 
+That table is for a master started as root, which drops the workers to the
+`user` directive. A master started as an ordinary user (for example
+`openresty -p ~/work` as `ubuntu`) ignores `user` and runs its workers as
+itself: set `ctl_socket_group` to that user's group (`ubuntu`).
+
 Check the real group with `ps -eo user,group,args | grep 'worker process'`.
 If the gateway runs in a container with the socket bind-mounted, the
 container's worker must have the same numeric gid as the group on the host.
