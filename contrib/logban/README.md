@@ -28,7 +28,20 @@ api.ratio = off
 api.max_backend_seconds = 30     # half a backend worker per address
 ```
 
-A forged user agent gets the same limits, not a pass.
+A forged user agent gets the same limits, not a pass. With a JA4 module,
+log `ja4=$http_ssl_ja4` and match your app's TLS stacks instead, which a
+script cannot fake with one header:
+
+```
+profile app = ja4:^t13d2014h2_a09f3c656075_14788d8d241b$
+app.ratio = off
+app.max_backend_seconds = 100
+profile api_other = path:^/api/       # any other stack: strict
+api_other.min_costly = 20
+```
+
+JA4 picks thresholds, never a pass: fingerprints change with OS updates
+and can be copied ([design §5.5](../../doc/logban.md#55-ja4)).
 
 ## Log format
 
@@ -54,6 +67,9 @@ python3 logban.py -n --top-paths 20 -c logban.conf /var/log/nginx/access.log
 # Each client's peak backend seconds per window, with percentiles:
 # choose max_backend_seconds from these.
 python3 logban.py -n --top-clients 20 -c logban.conf /var/log/nginx/access.log
+
+# Which TLS stacks call you? Build the ja4: profile lines from it.
+python3 logban.py -n --top-ja4 20 -c logban.conf /var/log/nginx/access.log
 
 # Replay old logs (gzip works): print what would have been banned.
 python3 logban.py -n -c logban.conf /var/log/nginx/access.log.*.gz

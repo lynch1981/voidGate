@@ -22,7 +22,7 @@ import logban  # noqa: E402
 T0 = datetime(2026, 10, 3, 10, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
-def line(ip, t, path, rt=None, urt=None, ua="Mozilla/5.0"):
+def line(ip, t, path, rt=None, urt=None, ua="Mozilla/5.0", ja4=None):
     stamp = datetime.fromtimestamp(t, timezone.utc).strftime(
         "%d/%b/%Y:%H:%M:%S +0000")
     s = '%s - - [%s] "GET %s HTTP/1.1" 200 512 "-" "%s"' % (
@@ -30,6 +30,9 @@ def line(ip, t, path, rt=None, urt=None, ua="Mozilla/5.0"):
 
     if rt is not None:
         s += " rt=%s urt=%s" % (rt, urt if urt is not None else "-")
+
+    if ja4 is not None:
+        s += " ja4=%s" % ja4
 
     return s + "\n"
 
@@ -95,7 +98,7 @@ class ParseTest(unittest.TestCase):
     def test_combined(self):
         self.assertEqual(logban.parse_line(
             line("203.0.113.7", T0, "/search?q=1")),
-            ("203.0.113.7", T0, "/search", None, "Mozilla/5.0"))
+            ("203.0.113.7", T0, "/search", None, "Mozilla/5.0", ""))
 
     def test_timing(self):
         self.assertEqual(logban.parse_line(
@@ -805,7 +808,8 @@ class ProfileTest(unittest.TestCase):
         cfg.set("export.max_backend_seconds", "300")
         cfg.check()
         judge = logban.Judge(cfg, Recorder(), out=io.StringIO())
-        of = judge.profile_of
+        def of(path, ua):
+            return judge.profile_of((path, ua, ""))
 
         self.assertEqual(of("/", "Mozilla/5.0"), 0)
         self.assertEqual(of("/api/search", APP), 1)
@@ -881,6 +885,151 @@ class ProfileTest(unittest.TestCase):
         self.assertRegex(text, r"198\.51\.100\.7  api +5\.0 ")
         self.assertRegex(text, r"\n  default +2 clients ")
         self.assertRegex(text, r"\n  api +1 clients  p50 5\.0")
+
+
+IOS = "t13d2014h2_a09f3c656075_14788d8d241b"
+OKHTTP = "t13d1516h2_8daaf6152771_02713d6af862"
+REQUESTS = "t13d1812h1_85036bcba153_b26ce05bbdd6"
+
+
+def ja4_config():
+    cfg = logban.Config()
+
+    for k, v in (("costly", "^/api/"),
+                 ("profile app", "ja4:^%s$" % IOS),
+                 ("profile app", "ja4:^%s$" % OKHTTP),
+                 ("app.ratio", "off"),
+                 ("app.max_backend_seconds", "100"),
+                 ("profile api_other", "path:^/api/"),
+                 ("api_other.min_costly", "20")):
+        cfg.set(k, v)
+
+    cfg.check()
+    return cfg
+
+
+class Ja4Test(unittest.TestCase):
+
+    def test_parse(self):
+        r = logban.parse_line(line("::1", T0, "/", rt="0.1", ja4=OKHTTP))
+        self.assertEqual(r[5], OKHTTP)
+        self.assertEqual(r[3], 0.1)
+
+        # no TLS, the module did not run, or no field at all
+        for s in (line("::1", T0, "/", ja4="-"), line("::1", T0, "/", ja4=""),
+                  line("::1", T0, "/")):
+            self.assertEqual(logban.parse_line(s)[5], "")
+
+        # ja4t= (the TCP fingerprint) is not ja4=
+        s = line("::1", T0, "/").replace("\n", " ja4t=1024_2-4-8_1460_7\n")
+        self.assertEqual(logban.parse_line(s)[5], "")
+
+    def test_exact_and_regex(self):
+        cfg = ja4_config()
+        cfg.set("profile legacy", "ja4:^t12d")
+        cfg.set("legacy.max_backend_seconds", "10")
+        cfg.check()
+        app, legacy = cfg.profiles[1], cfg.profiles[3]
+
+        # exact fingerprints are a set, not regexes
+        self.assertEqual(app.ja4, {IOS, OKHTTP})
+        self.assertEqual(app.match, [])
+        self.assertEqual(len(legacy.match), 1)
+
+        judge = logban.Judge(cfg, Recorder(), out=io.StringIO())
+        of = judge.profile_of
+        self.assertEqual(of(("/api/x", "", OKHTTP)), 1)
+        self.assertEqual(of(("/api/x", "", REQUESTS)), 2)
+        self.assertEqual(of(("/api/x", "", "")), 2)
+        self.assertEqual(of(("/", "", REQUESTS)), 0)
+        self.assertEqual(of(("/", "", "t12d0909h1_x_y")), 3)
+        # exact means exact
+        self.assertEqual(of(("/", "", OKHTTP + "0")), 0)
+
+    def test_known_stack_passes_unknown_banned(self):
+        def calls(ip, ja4, n=60):
+            return [line(ip, T0 + i * 0.5, "/api/search", rt="0.1",
+                         urt="0.1", ua=APP, ja4=ja4) for i in range(n)]
+
+        lines = merge(calls("198.51.100.1", IOS),
+                      calls("198.51.100.2", OKHTTP),
+                      # a script sending the app's user agent
+                      calls("203.0.113.7", REQUESTS),
+                      # plain HTTP, no fingerprint
+                      calls("203.0.113.8", ""))
+        act, out, _ = run(ja4_config(), lines)
+
+        self.assertEqual(sorted(ip for ip, _ in act.calls),
+                         ["203.0.113.7", "203.0.113.8"])
+        self.assertIn("rule=api_other.ratio", out)
+
+    def test_copied_fingerprint_still_limited(self):
+        # utls or curl-impersonate copying the iOS stack: the app's
+        # limits still apply
+        lines = [line("203.0.113.9", T0 + i * 0.2, "/api/report", rt="1",
+                      urt="1", ja4=IOS) for i in range(150)]
+        act, out, _ = run(ja4_config(), lines)
+
+        self.assertEqual(len(act.calls), 1)
+        self.assertIn("rule=app.backend", out)
+
+    def report(self, lines, n=10):
+        out = io.StringIO()
+        judge = logban.Judge(ja4_config(), Recorder(), out=out)
+        judge.ja4s = {}
+
+        for s in lines:
+            judge.feed(s)
+
+        judge.finish()
+        judge.report_ja4(n)
+        return judge, out.getvalue()
+
+    def test_top_ja4(self):
+        lines = merge(
+            [line("198.51.100.%d" % k, T0 + k, "/api/x", rt="0.1",
+                  urt="0.1", ua=APP, ja4=IOS) for k in range(1, 7)],
+            [line("198.51.100.9", T0 + k, "/api/x", ua="okhttp/4.12.0",
+                  ja4=OKHTTP) for k in range(3)],
+            [line("203.0.113.7", T0 + k * 0.1, "/api/x",
+                  ua="python-requests/2.31", ja4=REQUESTS)
+             for k in range(100)],
+            [line("192.0.2.1", T0, "/")])
+        judge, out = self.report(lines)
+        rows = out[out.index("\n  1  "):].splitlines()[1:]
+
+        self.assertRegex(rows[0], r"^  1  %s +100 +90\.9%% +1 +1 " % REQUESTS)
+        self.assertIn("100% python-requests/2.31", rows[0])
+        self.assertRegex(rows[1], r"^  2  %s +6 +5\.5%% +6 +0 +0\.6" % IOS)
+        self.assertRegex(rows[2], r"^  3  %s +3 " % OKHTTP)
+        self.assertRegex(rows[3], r"^  4  \(none\) +1 ")
+        # commented out, with what this run banned
+        self.assertIn("# profile app = ja4:^%s$    # 0 banned, %s"
+                      % (IOS, APP), out)
+        self.assertIn("# profile app = ja4:^%s$    # 1 banned, python"
+                      % REQUESTS, out)
+        self.assertNotIn("ja4:^$", out)
+
+        # uncommented, the lines load as a config
+        cfg = logban.Config()
+        cfg.set("costly", "x")
+
+        for ln in out.splitlines():
+            if ln.startswith("# profile "):
+                k, _, v = ln[2:].split("#")[0].partition("=")
+                cfg.set(k.strip(), v.strip())
+
+        cfg.set("app.max_backend_seconds", "100")
+        cfg.check()
+        self.assertEqual(cfg.profiles[1].ja4, {IOS, OKHTTP, REQUESTS})
+
+    def test_top_ja4_no_field(self):
+        _, out = self.report([line("198.51.100.1", T0, "/")])
+        self.assertIn("(no ja4= in the log)", out)
+
+    def test_off_by_default(self):
+        _, _, judge = run(ja4_config(), [line("::2", T0, "/", ja4=IOS)])
+        self.assertIsNone(judge.ja4s)
 
 
 if __name__ == "__main__":

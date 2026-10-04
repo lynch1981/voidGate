@@ -48,6 +48,9 @@ LINE = re.compile(
 # $upstream_response_time has spaces between tries: "0.5, 0.2 : 0.1".
 TIMING = re.compile(r'\b(rt|urt)=([-\d.,: ]+)')
 NUMBER = re.compile(r'\d+(?:\.\d+)?')
+# ja4=t13d1516h2_8daaf6152771_02713d6af862; "-" or empty when the
+# connection had no TLS or the module did not run.
+JA4 = re.compile(r'\bja4=([0-9a-z_]+)')
 
 
 class ConfigError(Exception):
@@ -141,8 +144,8 @@ def parse_ratio(value):
 
 
 class Profile:
-    """A set of thresholds, chosen per request by user agent or path.
-    Index 0 is "default": the global keys, for requests no profile
+    """A set of thresholds, chosen per request by path, user agent or
+    JA4. Index 0 is "default": the global keys, for requests no profile
     matched."""
 
     KEYS = {
@@ -151,16 +154,32 @@ class Profile:
         "max_backend_seconds": float,
     }
     NAME = re.compile(r"[a-z][a-z0-9_]*")
+    FIELDS = {"path": 0, "ua": 1, "ja4": 2}
+    EXACT_JA4 = re.compile(r"\^([0-9a-z_]+)\$")
 
     def __init__(self, name):
         self.name = name
         self.prefix = "" if name == "default" else name + "."
-        self.match = []             # (field, regex), any one matches
+        self.match = []             # (field index, regex), any one matches
+        self.ja4 = set()            # ja4:^<fingerprint>$, matched as a set
         self.keys = {}              # overrides of the global KEYS
 
-    def matches(self, path, ua):
-        return any(rx.search(path if field == "path" else ua)
-                   for field, rx in self.match)
+    def add(self, field, rx):
+        # An allowlist is dozens of exact fingerprints: one set lookup
+        # instead of a regex each.
+        m = self.EXACT_JA4.fullmatch(rx) if field == "ja4" else None
+
+        if m:
+            self.ja4.add(m.group(1))
+
+        else:
+            self.match.append((self.FIELDS[field], re.compile(rx)))
+
+    def matches(self, values):
+        """values: (path, user agent, ja4)"""
+
+        return (values[2] in self.ja4
+                or any(rx.search(values[i]) for i, rx in self.match))
 
 
 class Config:
@@ -247,8 +266,8 @@ class Config:
             if not Profile.NAME.fullmatch(name) or name == "default":
                 raise ValueError("bad profile name %r" % name)
 
-            if not sep or field not in ("ua", "path") or not rx:
-                raise ValueError("expected ua:<regex> or path:<regex>")
+            if not sep or field not in Profile.FIELDS or not rx:
+                raise ValueError("expected path:, ua: or ja4:<regex>")
 
             p = self.profile(name)
 
@@ -256,7 +275,7 @@ class Config:
                 p = Profile(name)
                 self.profiles.append(p)
 
-            p.match.append((field, re.compile(rx)))
+            p.add(field, rx)
 
         elif "." in key and key.split(".", 1)[1] in Profile.KEYS:
             name, sub = key.split(".", 1)
@@ -331,8 +350,8 @@ def parse_time(s):
 
 
 def parse_line(line):
-    """Return (ip, epoch, path, backend_seconds or None, user agent),
-    or None."""
+    """Return (ip, epoch, path, backend_seconds or None, user agent,
+    ja4 or ""), or None."""
 
     m = LINE.match(line)
 
@@ -362,7 +381,13 @@ def parse_line(line):
             cost = sum(float(v) for v in values)
             break
 
-    return ip, t, path, cost, ua or ""
+    ja4 = ""
+
+    if "ja4=" in rest:
+        m = JA4.search(rest)
+        ja4 = m.group(1) if m else ""
+
+    return ip, t, path, cost, ua or "", ja4
 
 
 class Window:
@@ -436,6 +461,7 @@ class Judge:
         self.unjudged = 0
         self.history = None         # list: keep every ban (--review)
         self.peaks = None           # dict: per-client peaks (--top-clients)
+        self.ja4s = None            # dict: per-JA4 totals (--top-ja4)
 
     def feed(self, line):
         r = parse_line(line)
@@ -444,7 +470,7 @@ class Judge:
             self.skipped += 1
             return
 
-        ip, t, path, cost, ua = r
+        ip, t, path, cost, ua, ja4 = r
         self.lines += 1
         self.clock(t)
 
@@ -472,7 +498,7 @@ class Judge:
                   or (cost is not None and self.cfg.slow_seconds > 0
                       and cost >= self.cfg.slow_seconds))
 
-        key = (ip, self.profile_of(path, ua)
+        key = (ip, self.profile_of((path, ua, ja4))
                    if len(self.cfg.profiles) > 1 else 0)
         self.win.add(key, int(costly), cost or 0.0)
 
@@ -485,13 +511,26 @@ class Judge:
 
             pk[3] += 1
 
-    def profile_of(self, path, ua):
-        """Index of the first profile that matches, 0 for default."""
+        if self.ja4s is not None:
+            j = self.ja4s.get(ja4)
+
+            if j is None:
+                # requests, backend s, addresses, user agents
+                j = self.ja4s[ja4] = [0, 0.0, set(), collections.Counter()]
+
+            j[0] += 1
+            j[1] += cost or 0.0
+            j[2].add(ip)
+            j[3][ua] += 1
+
+    def profile_of(self, values):
+        """Index of the first profile that matches (path, user agent,
+        ja4), 0 for default."""
 
         profiles = self.cfg.profiles
 
         for i in range(1, len(profiles)):
-            if profiles[i].matches(path, ua):
+            if profiles[i].matches(values):
                 return i
 
         return 0
@@ -730,6 +769,43 @@ class Judge:
         if not self.timed:
             out.write("(no rt=/urt= in the log: requests, not backend"
                       " seconds)\n")
+
+    def report_ja4(self, n):
+        """Print the JA4 fingerprints by requests, with the user agent
+        each one sends most, then profile lines to paste."""
+
+        out = self.out
+        rows = sorted(self.ja4s.items(), key=lambda kv: (-kv[1][0], kv[0]))
+        all_req = sum(j[0] for _, j in rows) or 1
+
+        out.write("\nJA4 fingerprints by requests (allowlisted addresses are"
+                  " not judged, so not counted)\n")
+
+        if not rows or (len(rows) == 1 and rows[0][0] == ""):
+            out.write("(no ja4= in the log)\n")
+            return
+
+        out.write("%3s  %-36s %9s %6s %9s %6s %10s  %s\n"
+                  % ("#", "ja4", "requests", "share", "addresses", "banned",
+                     "backend_s", "top user agent"))
+
+        for i, (ja4, (req, cost, addrs, uas)) in enumerate(rows[:n], 1):
+            ua, count = uas.most_common(1)[0]
+            out.write("%3d  %-36s %9d %5.1f%% %9d %6d %10.1f  %d%% %s\n"
+                      % (i, ja4 or "(none)", req, req * 100 / all_req,
+                         len(addrs), len(addrs & self.offenses.keys()),
+                         cost, count * 100 // req, (ua or "-")[:48]))
+
+        # Commented out: pasting them all would give whatever else is in
+        # the log, an attacker's script included, the app's limits.
+        out.write("\n# Uncomment only your app's fingerprints; lines with one"
+                  " name OR.\n")
+
+        for ja4, (_, _, addrs, uas) in rows[:n]:
+            if ja4:
+                out.write("# profile app = ja4:^%s$    # %d banned, %s\n"
+                          % (ja4, len(addrs & self.offenses.keys()),
+                             (uas.most_common(1)[0][0] or "-")[:48]))
 
     def log(self, msg):
         warn(msg)
@@ -1001,6 +1077,9 @@ def main(argv=None):
     ap.add_argument("--top-clients", type=int, metavar="N", default=0,
                     help="at the end, print the N clients with the highest"
                          " peak backend seconds, and percentiles")
+    ap.add_argument("--top-ja4", type=int, metavar="N", default=0,
+                    help="at the end, print the N most used JA4"
+                         " fingerprints, and profile lines for them")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(argv)
 
@@ -1035,6 +1114,9 @@ def main(argv=None):
     if args.top_clients:
         judge.peaks = {}
 
+    if args.top_ja4:
+        judge.ja4s = {}
+
     if args.follow:
         if len(args.logs) != 1 or args.logs[0] == "-":
             sys.stderr.write("logban: -f takes one log file\n")
@@ -1058,7 +1140,8 @@ def main(argv=None):
 
     judge.finish()
 
-    if args.verbose or args.top_paths or args.top_clients:
+    if args.verbose or args.top_paths or args.top_clients \
+            or args.top_ja4:
         sys.stderr.write("logban: %d lines, %d unparsed, %d allowed\n"
                          % (judge.lines + judge.skipped, judge.skipped,
                             judge.unjudged))
@@ -1068,6 +1151,9 @@ def main(argv=None):
 
     if args.top_clients:
         judge.report_clients(args.top_clients)
+
+    if args.top_ja4:
+        judge.report_ja4(args.top_ja4)
 
     if args.review:
         try:

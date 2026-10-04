@@ -48,6 +48,8 @@ In scope:
   this format.
 - **Per-address rules** over a sliding window, with timed drops through
   the existing `drop <ip> ttl=<sec>` (l7-bridge §4).
+- **Profiles** by path, user agent or JA4 TLS fingerprint, each with its
+  own thresholds (§5.4, §5.5).
 - **Replay**, to tune thresholds on old logs, **review**, to ban only
   what a person confirms, and **follow**, to enforce live.
 - **A CDN in front:** its edges are never banned (§8).
@@ -120,6 +122,13 @@ log_format logban '$remote_addr - $remote_user [$time_local] "$request" '
                   'urt=$upstream_response_time';
 ```
 
+With a JA4 module (FoxIO's `ja4-nginx-module`; take the variable name
+from its README), append the fingerprint too:
+
+```nginx
+                  'urt=$upstream_response_time ja4=$http_ssl_ja4';
+```
+
 | Field | Used for |
 |---|---|
 | first word | the address that is judged and banned. It **must be the TCP peer** (§8). |
@@ -128,6 +137,7 @@ log_format logban '$remote_addr - $remote_user [$time_local] "$request" '
 | `$http_user_agent` | profile matching only (§5.4); never trusted to exempt |
 | `urt=` | backend seconds: the sum of every upstream tried (`0.5, 0.2 : 0.1`) |
 | `rt=` | used when `urt` is `-` (nginx answered itself) |
+| `ja4=` | profile matching and `--top-ja4` (§5.5); `-` or missing reads as none. `ja4t=` (the TCP fingerprint) is ignored. |
 
 Lines that do not parse are counted and skipped.
 
@@ -205,8 +215,9 @@ api.ratio = off
 api.max_backend_seconds = 30     # half a worker per address
 ```
 
-- **Chosen per request.** The first declared profile whose `ua:` or
-  `path:` regex matches; `default` (the global keys) when none does.
+- **Chosen per request.** The first declared profile whose `path:`,
+  `ua:` or `ja4:` regex matches; `default` (the global keys) when none
+  does.
 - **Counted apart.** The window is keyed by (address, profile). One NAT
   address with app users and browsers keeps two counters, so the app's
   costly calls do not push the browsers' ratio over the line.
@@ -225,6 +236,57 @@ api.max_backend_seconds = 30     # half a worker per address
   (p99.9), a NAT with ~30 of them at 31.4 s, and a bot forging the app's
   user agent at 379 s: `api.max_backend_seconds = 30` banned the NAT too,
   100 would separate them. Read `--top-clients` before choosing.
+
+### 5.5 JA4
+
+JA4 fingerprints the TLS ClientHello: version, cipher suites,
+extensions, ALPN. It is a better signal than a user agent, because a
+script has to change its TLS stack to fake it, not one header. A
+profile matches it like any other field:
+
+```
+profile app = ja4:^t13d2014h2_a09f3c656075_14788d8d241b$     # iOS app
+profile app = ja4:^t13d1516h2_8daaf6152771_02713d6af862$     # Android app
+app.ratio = off
+app.max_backend_seconds = 100
+
+profile api_other = path:^/api/       # API calls from any other stack
+api_other.min_costly = 20             # banned fast
+```
+
+An exact `ja4:^<fingerprint>$` goes into a set, so an allowlist of
+dozens costs one lookup per line; any other `ja4:` is a regex.
+
+**Thresholds, not an allowlist.** "Allow these fingerprints, block the
+rest" fails real users:
+
+| Property | Consequence |
+|---|---|
+| A fingerprint is a TLS stack, not an app | iOS `URLSession` is shared by Safari and every iOS app; OkHttp by every app on that version. Matching keeps out `python-requests`, Go's `net/http` and `curl`, not other apps. |
+| OS and library updates change it | release day brings new fingerprints; a hard allowlist would block every updated user |
+| Android fleets vary | dozens of fingerprints across OS versions and vendors |
+| TLS-inspecting proxies and antivirus re-handshake | their users show the middlebox's fingerprint |
+| It can be copied | `curl-impersonate`, `utls`, `curl_cffi` copy iOS or Chrome exactly |
+| A CDN terminates TLS | the origin sees the CDN's handshake; take JA4 from the CDN, and check it there |
+
+So a missing fingerprint moves its users to the stricter `api_other`,
+which bans only those that also flood, and a copied fingerprint still
+meets `app.max_backend_seconds`. Build the list from `--top-ja4` on
+shadow logs (§10), not by hand, and run it again after each iOS or
+Android release.
+
+Synthetic test (82k lines: 300 app users, 500 browsers, two bots), with
+the profiles above and `app.max_backend_seconds = 30`:
+
+| Client | Profile | Result |
+|---|---|---|
+| a script sending the app's user agent from `python-requests` | `api_other` | banned after 20 costly calls |
+| an impersonator with the iOS fingerprint, 0.8 s calls | `app` | banned, `rule=app.backend` |
+| app users (peak 5.0 s), browsers | `app`, `default`, `api_other` | none banned |
+
+Blocking unknown fingerprints at request time belongs in nginx, not in
+logban or XDP: XDP would have to reassemble and parse TLS, and logban
+only sees a request after it was served.
 
 ## 6. Exemptions
 
@@ -437,6 +499,26 @@ peak backend s per window, clients not banned:
   default    3001 clients  p50 6.4  p90 8.8  p99 11.2  p99.9 13.6  max 146.0
 ```
 
+`--top-ja4 N` prints the N most used JA4 fingerprints: requests, share,
+distinct addresses, addresses this run banned, backend seconds, and the
+user agent each sends most. Then one profile line per fingerprint,
+**commented out**: pasting them all would give whatever else is in the
+log the app's limits, an attacker's script included.
+
+```
+  #  ja4                                   requests  share addresses banned  backend_s  top user agent
+  1  t13d2014h2_a09f3c656075_14788d8d241b     41519  50.4%       201      1     4618.4  100% MyShop/5.2.1 (iOS 18.0)
+  4  t13d1812h1_85036bcba153_b26ce05bbdd6       909   1.1%         1      0      272.7  100% MyShop/5.2.1 (iOS 18.0)
+
+# Uncomment only your app's fingerprints; lines with one name OR.
+# profile app = ja4:^t13d2014h2_a09f3c656075_14788d8d241b$    # 1 banned, MyShop/5.2.1 (iOS 18.0)
+```
+
+Read `addresses` with the user agent: row 4 claims to be the iOS app,
+but its 909 requests come from one address, while the real iOS stack in
+row 1 is spread over 201. Requests without a fingerprint show as
+`(none)`.
+
 Peaks are sampled at each judgment step. Allowlisted addresses are not
 judged, so they are not listed. In a replay a banned client keeps
 sending (§7.2), so its peak can be higher than at its ban. Without timing
@@ -455,6 +537,7 @@ browsers, a CGNAT address and 15 bots.
 | allowlist filter (§6.1) | about 8 % of that time |
 | one `ua:` profile (§5.4) | about 20 % more: a regex on every line |
 | `--top-clients` | about 30 % more: peaks updated every step |
+| a log without `ja4=` | no cost: the field is searched only when present |
 
 A busy single VM logs far fewer lines per second. Past that rate, run it
 under PyPy, or sample the log.
@@ -480,6 +563,9 @@ The offense counts are kept for every address ever banned (§15).
   reverse DNS exempts (§6.3).
 - **User agent spoofing.** A user agent only picks a profile's
   thresholds, and every profile must be able to ban (§5.4).
+- **JA4 spoofing.** Same rule: a copied fingerprint picks thresholds,
+  never a pass (§5.5). `--top-ja4` prints its profile lines commented
+  out, so an attacker's fingerprint is never allowlisted by a paste.
 - **A poisoned CDN list** could turn logban off for large ranges.
   `cdn_allow.py` fetches over HTTPS and refuses anything wider than `/8`
   or `/16` (§9).
@@ -520,6 +606,11 @@ The offense counts are kept for every address ever banned (§15).
   flooded `-v` output (§6.1).
 - **Checking crawlers as lines are read.** That is a DNS lookup per new
   address.
+- **A hard JA4 allowlist** (block every other fingerprint). Blocks
+  users after an OS update, behind a TLS-inspecting proxy, or on an
+  uncommon Android build, and copied fingerprints pass it (§5.5).
+- **JA4 in XDP.** Means reassembling and parsing TLS from packets;
+  voidGate only looks prefixes up.
 - **Exempting API clients by user agent.** Their user agent is stable,
   but anyone can send it; it would be a free pass. Profiles use it to
   pick thresholds instead (§5.4).
@@ -558,8 +649,8 @@ Future work:
 - **More CDN providers** in `cdn_allow.py`.
 - **Typical cost per path**, learned from quiet periods, so the backend
   rule does not tighten on everyone when the backend slows down.
-- **Profiles by a stronger identity**: a hashed API key or a JA4 TLS
-  fingerprint logged as a field, matched like `ua:`.
+- **Profiles by a hashed API key**, logged as a field and matched like
+  `ja4:`, for APIs that issue keys.
 - **Persisting offense counts** across restarts, and pruning them after
   `offense_memory` (today they live as long as the process).
 - **A systemd unit** for follow mode.
@@ -579,6 +670,7 @@ no daemon, about one second.
 | `FollowTest` | follow across a rename rotation, counts kept |
 | `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked |
 | `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
+| `Ja4Test` | `ja4=` parsed, `-` / empty / missing as none, `ja4t=` ignored; exact fingerprints held as a set, other `ja4:` as regexes, exact means exact; known stacks pass while a script with the app's user agent and a plain-HTTP client are banned by `api_other`; a copied fingerprint banned by `app.backend`; `--top-ja4` columns, share, banned count, commented paste lines that load once uncommented; no `ja4=` in the log; off unless asked |
 | `ReviewTest` | selection parsing (all, none, ranges, out of range, junk); table rows per address, most costly first, ttl doubled for a repeat; a bad answer asks again; end of input bans nothing; a failed ban exits 1; `-n` only prints; nothing to review; refused with `-f` |
 | `CdnAllowTest` | Cloudflare JSON parsed and sorted; refused inputs (failure flag, a family missing, too wide, bad CIDR, wrong type, HTML); write, no rewrite when unchanged, failure keeps the file, no temp files left |
 
