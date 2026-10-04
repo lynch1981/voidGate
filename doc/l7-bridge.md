@@ -273,11 +273,11 @@ lua-nginx-module. It follows the OpenResty `resty.*` naming convention.
 
 ```lua
 local vg = require("resty.voidgate")
-vg.ban(ip, ttl, { dict = "voidgate_ban", window = 10, client = c })
+vg.ban(ip, ttl, { dict = "voidgate_ban", window = 10, client = c })  -- 10s
 vg.ban_now(ip, ttl, { client = c })            -- true, or nil, err
 vg.drop(cidr, ttl) / vg.undrop(cidr)           -- prefixes, ttl required
 vg.status() / vg.stats() / vg.drops() / vg.arm() / vg.disarm() / vg.reload()
-vg.new({ path = "/run/voidgate.sock", timeout = 1 })   -- seconds
+vg.new({ path = "/run/voidgate.sock", timeout = 1 })   -- 1s
 ```
 
 **Which call.** Request code bans one client address; `ban()` and

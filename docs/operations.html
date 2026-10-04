@@ -273,7 +273,7 @@ location / {
     limit_req_status 429;
     log_by_lua_block {
         if ngx.status == 429 then
-            require("resty.voidgate").ban(ngx.var.remote_addr, 600,
+            require("resty.voidgate").ban(ngx.var.remote_addr, 600,  -- 10m
                                           { dict = "voidgate_ban" })
         end
     }

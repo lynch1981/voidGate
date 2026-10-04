@@ -144,7 +144,7 @@ location / {
     limit_req_status 429;
     log_by_lua_block {
         if ngx.status == 429 then
-            require("resty.voidgate").ban(ngx.var.remote_addr, 600,
+            require("resty.voidgate").ban(ngx.var.remote_addr, 600,  -- 10m
                                           { dict = "voidgate_ban" })
         end
     }
@@ -187,9 +187,9 @@ local vg = require("resty.voidgate")
 local status = assert(vg.status())
 ngx.say(status.state, " ", status.rx_pps)
 
-local ok, err = vg.ban_now("203.0.113.7", 600)  -- the daemon's answer
+local ok, err = vg.ban_now("203.0.113.7", 600)  -- 10m; the daemon's answer
 
-assert(vg.drop("203.0.113.0/24", 600))           -- a prefix; ttl required
+assert(vg.drop("203.0.113.0/24", 600))           -- 10m; a prefix, ttl required
 assert(vg.undrop("203.0.113.0/24"))
 
 -- Optional settings; each call opens and closes its own connection.
