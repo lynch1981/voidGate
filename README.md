@@ -91,6 +91,12 @@ or APISIX, decide which client is abusive (`limit_req`, failed logins, bot
 rules) and push that address down to XDP with a timed drop. The design and
 its trade-offs are in [`doc/l7-bridge.md`](doc/l7-bridge.md).
 
+A complete OpenResty config is in
+[`contrib/openresty/nginx.conf`](contrib/openresty/nginx.conf): the shared
+dict, a honeypot path banned with `ban_now()` in the access phase,
+`limit_req` 429s banned with `ban()` in the log phase, a health timer, and
+a local status page.
+
 `lua/resty/voidgate.lua` is a non-blocking client. It talks to the daemon's
 Unix socket with an `ngx.socket.tcp` cosocket and needs no other library.
 Install it into OpenResty's lualib, or point `LUA_DIR` at your gateway's
@@ -116,6 +122,11 @@ config to the workers' group and restart voidgate. The daemon then creates
 ctl_socket_group = kong
 ```
 
+That table is for a master started as root, which drops the workers to the
+`user` directive. A master started as an ordinary user (for example
+`openresty -p ~/work` as `ubuntu`) ignores `user` and runs its workers as
+itself: set `ctl_socket_group` to that user's group (`ubuntu`).
+
 Check the real group with `ps -eo user,group,args | grep 'worker process'`.
 If the gateway runs in a container with the socket bind-mounted, the
 container's worker must have the same numeric gid as the group on the host.
@@ -133,20 +144,27 @@ location / {
     limit_req_status 429;
     log_by_lua_block {
         if ngx.status == 429 then
-            require("resty.voidgate").ban(ngx.var.remote_addr, 600,
+            require("resty.voidgate").ban(ngx.var.remote_addr, 600,  -- 10m
                                           { dict = "voidgate_ban" })
         end
     }
 }
 ```
 
-`ban(ip, ttl, opt)` works from any phase, log included: it queues the
-request in an `ngx.timer.at` timer and returns `true`. The daemon's answer
-goes to the nginx error log. With `opt.dict`, an address is sent at most
-once per `opt.window` seconds (default 10), so the burst before XDP takes
-over does not queue one timer per request. `opt.client` takes a client from
-`new()`. A Kong or APISIX plugin calls the same function from its `log`
-handler.
+`ban(ip, ttl, opt)` works from every phase but `init_by_lua*`, log included:
+it queues the request in an `ngx.timer.at` timer and returns `true`. The
+daemon's answer goes to the nginx error log. With `opt.dict`, an address is
+sent at most once per `opt.window` seconds (default 10), so the burst before
+XDP takes over does not queue one timer per request. `opt.client` takes a
+client from `new()`. A Kong or APISIX plugin calls the same function from
+its `log` handler.
+
+When the caller needs the daemon's answer, for example in `access_by_lua*`
+or a timer, use `ban_now(ip, ttl)`: the same rules, sent at once, returning
+`true` or `nil, err` (a refused address, a daemon that is down). It needs a
+cosocket, so in the log phase it returns `nil, "no cosocket in this phase,
+use ban()"`. Every drop from Lua has a ttl; a permanent drop is an
+operator's decision (`voidgatectl drop <cidr>`).
 
 The ban is `drop <ip> ttl=<ttl>` on the socket (`reason=4`). It lifts itself
 after `ttl` seconds (1 to one year). Banning the same prefix again only
@@ -169,7 +187,9 @@ local vg = require("resty.voidgate")
 local status = assert(vg.status())
 ngx.say(status.state, " ", status.rx_pps)
 
-assert(vg.drop("203.0.113.0/24"))
+local ok, err = vg.ban_now("203.0.113.7", 600)  -- 10m; the daemon's answer
+
+assert(vg.drop("203.0.113.0/24", 600))           -- 10m; a prefix, ttl required
 assert(vg.undrop("203.0.113.0/24"))
 
 -- Optional settings; each call opens and closes its own connection.
@@ -178,8 +198,10 @@ local stats = assert(client:stats())
 ngx.say(stats.rx_pkts) -- Decimal string: preserves all 64 bits.
 ```
 
-Cosockets yield, so call methods from `rewrite`, `access`, `content` or a
-timer. Use `ban()` from any other phase.
+Cosockets yield, so call the methods and `ban_now()` from `rewrite`,
+`access`, `content` or a timer; elsewhere they return `nil, err`. Use
+`ban()` from the other phases; neither works in `init_by_lua*`.
+The full table is in `doc/l7-bridge.md` §9.
 
 | Method | Successful return |
 | --- | --- |
@@ -187,8 +209,9 @@ timer. Use `ban()` from any other phase.
 | `stats()` | Table: counters as decimal strings; numeric rates and prefix count; string `state` |
 | `drops()` | Array of `{ cidr, reason, age }` entries; empty array when there are no drops |
 | `arm()`, `disarm()`, `reload()` | `true` |
-| `drop(cidr [, ttl])`, `undrop(cidr)` | `true`; with `ttl` (seconds, 1–31536000) the daemon lifts the drop itself |
+| `drop(cidr, ttl)`, `undrop(cidr)` | `true`; `ttl` (seconds, 1–31536000) is required, and the daemon lifts the drop itself |
 | `ban(ip, ttl [, opt])` | `true` once queued; see above |
+| `ban_now(ip, ttl [, opt])` | `true`, or `nil, err` with the daemon's answer |
 
 Operations return `nil, error` on connection, timeout, or daemon errors.
 CIDR validity is checked by the daemon; the client only rejects a CIDR
@@ -211,10 +234,10 @@ support, curl, and OpenResty or nginx with `lua-nginx-module`; on Ubuntu,
 sudo t/integration/resty.sh
 ```
 
-It runs nginx in private namespaces with workers as `nobody:nogroup`, the
-method tests in `t/integration/resty.lua`, and `ban()` from the log phase.
-It skips when neither `openresty` nor `nginx` is in `PATH`; set `NGINX` to
-choose the binary.
+`resty.sh` runs nginx in private namespaces with workers as
+`nobody:nogroup`, the method tests in `t/integration/resty.lua`, and `ban()`
+from the log phase. It skips when neither `openresty` nor `nginx` is in
+`PATH`; set `NGINX` to choose the binary.
 
 ## How it decides
 
@@ -237,6 +260,7 @@ src/bpf/voidgate.h       shared map/packet structs
 src/voidgate.c           daemon
 src/voidgatectl.c        voidgatectl
 lua/resty/voidgate.lua   OpenResty control client
+contrib/openresty/       example OpenResty config
 src/policy.c             IDLE/ACTIVE policy
 src/maps.c               libbpf attach + LPM helpers
 ```
