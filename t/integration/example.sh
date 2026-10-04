@@ -150,6 +150,16 @@ done
 [[ $(code 198.18.1.1 "$url/wp-login.php") == 403 ]]
 listed 198.18.1.1
 
+# Every honeypot path, with or without a trailing part; a lookalike is not.
+[[ $(code 198.18.1.5 "$url/.git") == 403 ]]
+listed 198.18.1.5
+[[ $(code 198.18.1.6 "$url/.git/config") == 403 ]]
+listed 198.18.1.6
+[[ $(code 198.18.1.7 "$url/xmlrpc.php") == 403 ]]
+listed 198.18.1.7
+[[ $(code 198.18.1.8 "$url/.github") == 200 ]]
+refute listed 198.18.1.8
+
 # A protected address is refused, logged, and still gets the 403.
 [[ $(code 127.0.0.1 "$url/.env") == 403 ]]
 grep -q 'voidgate ban_now 127.0.0.1: error: refused' "$prefix/error.log"
