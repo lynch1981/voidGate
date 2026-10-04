@@ -108,6 +108,7 @@ render() {
 
 render '"/usr/local/openresty/site/lualib/?.lua;;"' "\"$work/lua/?.lua;;\""
 render 'listen 8080;' 'listen 127.0.0.1:8080;'
+render 'error_log logs/error.log error;' "error_log $prefix/error.log error;"
 render '# set_real_ip_from 10.0.0.0/8;' 'set_real_ip_from 127.0.0.1;'
 render '# real_ip_header   X-Forwarded-For;' 'real_ip_header X-Forwarded-For;'
 
