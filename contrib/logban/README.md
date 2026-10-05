@@ -28,7 +28,7 @@ flooding `/search` loads nothing else.
 
 A request is **costly** if its path matches a `costly` regex, or its
 backend time is at least `slow_seconds`. Find them with `--top-paths`
-([Run](#run)).
+([Tune, then enforce](#tune-then-enforce)).
 
 | Rule | Fires when |
 |---|---|
@@ -128,6 +128,44 @@ login.ratio = 0.5
 attempts each, stays under any per-address count. That needs the app:
 rate limits per account, or a challenge.
 
+## Safe by default
+
+A ban that hits a real visitor costs more than a bot that gets through
+for another minute. logban is built so that one is rare and cheap:
+
+- **Browsers pass the CC rules on their own traffic.** They load pages,
+  CSS, JS and images, so their costly share stays far under 0.9, even
+  behind a CGNAT or office address with hundreds of users. Attack mode
+  never lowers that ratio.
+- **Real search engine crawlers are not banned; fakes are.** List their
+  domains (`logban.conf` has the usual five, commented out; the list is
+  empty by default):
+
+  ```
+  crawler = googlebot.com
+  crawler = search.msn.com
+  ```
+
+  An address whose user agent claims to be a crawler is checked by
+  reverse DNS and then forward DNS, as the search engines document. A
+  scraper copying Googlebot's user agent fails and is banned. The user
+  agent alone never exempts anyone
+  ([design §6.3](../../doc/logban.md#63-crawlers)).
+- **Your own networks are never banned.** List monitoring, office egress
+  and load balancers in `allow` (loopback always is), CDN ranges in an
+  `allow_file`. voidGate refuses drops for its own `local_*` and
+  `allow_*` networks too; logban then holds that address for the ban's
+  ttl instead of asking every 10 s
+  ([design §7.2](../../doc/logban.md#72-after-a-ban)).
+- **A mistake costs a minute.** The first ban is 60 s, doubled only for a
+  repeat, and capped at 15 minutes.
+- **Apps get their own limits, not a pass.** A profile gives your app's
+  users thresholds that fit them; a bot forging the app's user agent or
+  copying its TLS fingerprint meets the same limits
+  ([CC attacks](#cc-attacks)).
+- **You see it before it bans.** Replay, review and explain run on old
+  logs and send nothing ([Tune, then enforce](#tune-then-enforce)).
+
 ## Log format
 
 `combined` works. Add timing so logban can find costly paths itself:
@@ -149,36 +187,54 @@ nginx's field names (`remote_addr`, `time_local`, `request`, `status`,
 the `json_*` keys in `logban.conf`
 ([design §4.2](../../doc/logban.md#42-json)).
 
-## Run
+## Tune, then enforce
+
+Run each step on a normal week of logs (`.gz` and `-` for stdin work).
+Nothing is sent to voidGate until step 5.
+
+**1. What is costly?** The paths that cost the backend most: write the
+`costly` regexes from them.
 
 ```sh
-# Which paths cost the backend most? Write the costly regexes from it.
-python3 logban.py -n --top-paths 20 -c logban.conf /var/log/nginx/access.log
+python3 logban.py -n --top-paths 20 -c logban.conf /var/log/nginx/access.log.*.gz
+```
 
-# Each client's peak backend seconds per window, with percentiles:
-# choose max_backend_seconds from these.
-python3 logban.py -n --top-clients 20 -c logban.conf /var/log/nginx/access.log
+**2. What is normal?** Each client's peak backend seconds per window,
+with percentiles per profile: choose `max_backend_seconds` above them.
+The last line is the whole site's peak: set the attack mode thresholds
+above it. `--top-ja4` lists the TLS stacks that call you, with profile
+lines to uncomment for your app's; `--top-allowed` how much arrives
+through the CDN, which only the CDN can stop.
 
-# Which TLS stacks call you? Build the ja4: profile lines from it.
-python3 logban.py -n --top-ja4 20 -c logban.conf /var/log/nginx/access.log
+```sh
+python3 logban.py -n --top-clients 20 -c logban.conf /var/log/nginx/access.log.*.gz
+python3 logban.py -n --top-ja4 20 -c logban.conf /var/log/nginx/access.log.*.gz
+python3 logban.py -n --top-allowed 10 -c logban.conf /var/log/nginx/access.log.*.gz
+```
 
-# How much traffic arrives through the CDN (the allowlists), and how
-# much of it is costly: that part only the CDN can stop.
-python3 logban.py -n --top-allowed 10 -c logban.conf /var/log/nginx/access.log
+**3. Who would be banned?** Replay as a dry run and review the list, one
+row per address, most bans first. `--json` gives the same list, and any
+`--top-*` report, to a program such as a web console; it can ban a row
+with `voidgatectl drop <address> ttl=<ttl>`.
 
-# Replay old logs (gzip works): print what would have been banned.
-python3 logban.py -n -c logban.conf /var/log/nginx/access.log.*.gz
+```sh
+python3 logban.py -r -c logban.conf /var/log/nginx/access.log.*.gz
+python3 logban.py -r --json --top-clients 20 -c logban.conf /var/log/nginx/access.log
+```
 
-# Replay and list what would be banned, one row per address, for a
-# person or a web console to decide on (--json for a program). Sends
-# nothing; ban a row with: voidgatectl drop <address> ttl=<ttl>
-python3 logban.py -r -c logban.conf /var/log/nginx/access.log
-python3 logban.py -r --json -c logban.conf /var/log/nginx/access.log
+**4. Why that one?** Every judgment of one address, with the thresholds
+it was measured against: why it was banned, or why not.
 
-# "Why was 203.0.113.7 banned?" (or why not): every judgment of it.
+```sh
 python3 logban.py -c logban.conf -x 203.0.113.7 /var/log/nginx/access.log
+```
 
-# Live and dry, then live and enforcing (root or ctl_socket_group).
+**5. Live.** Dry first, then enforcing (root, or a member of voidGate's
+`ctl_socket_group`). It follows the log like `tail -F`, through rotation
+by rename or `copytruncate`, and picks up a changed `allow_file` within
+one step.
+
+```sh
 python3 logban.py -n -f -c logban.conf /var/log/nginx/access.log
 sudo python3 logban.py -f -c logban.conf /var/log/nginx/access.log
 ```
@@ -218,6 +274,23 @@ echo "allow_networks = 169.254.169.254/32, 127.0.0.0/8, ::1/128," \
      paste -sd, | sed 's/,/, /g')"
 # paste the line into voidgate.conf, then: sudo voidgatectl reload
 ```
+
+## Limits
+
+- **Clients behind a CDN** cannot be banned at XDP: their packets come
+  from the CDN's edges. Only the CDN can stop them.
+- **Credential stuffing over many addresses**, a few attempts each, and
+  **slow botnets that copy a common browser's TLS stack and user agent**
+  pass every per-address rule. They need the app, `limit_req`, or a
+  challenge page.
+- **Not instant.** A ban comes up to one step (10 s) after the threshold,
+  plus nginx's log buffering. Honey paths ban on the line itself.
+- **One log, one machine.** No shared state between servers.
+- **No memory across restarts.** Repeat-offense counts start over.
+- **Follow mode prints no `--top-*` reports**; run them on a replay.
+- **No systemd unit yet.** Run `-f` under your own supervisor.
+
+Details and future work: [design §15](../../doc/logban.md#15-limits-and-future-work).
 
 ## Tests
 
