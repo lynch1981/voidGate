@@ -918,7 +918,7 @@ class Explain:
 
     def verdict(self, now, rule):
         # step() returns early while the address is banned
-        why = self.judge.exempt_reason(self.ip)
+        why = self.judge.exempt.reason(self.ip)
 
         if why:
             return "fires %s, exempt: %s" % (rule, why)
@@ -1026,6 +1026,167 @@ class Explain:
             out.write("bans: none\n")
 
 
+class Exempt:
+    """Who a rule may not ban: allowlisted addresses, and crawlers whose
+    reverse DNS checks out. Every answer is cached per address."""
+
+    def __init__(self, cfg, resolve, verbose=0):
+        self.cfg = cfg
+        self.resolve = resolve
+        self.verbose = verbose
+        self.listed = {}            # ip -> "allow", "bad-address" or ""
+        self.sources = {}           # ip -> its allowlist, or "" (cache)
+        self.crawlers = {}          # ip -> verified crawler (DNS cache)
+        self.claims = set()         # ips whose user agent claimed a crawler
+        self.claim_ua = {}          # user agent -> claims (cache)
+        self.dns_timeouts = 0
+
+    def refresh(self):
+        """Reload changed allow_files, and forget what they answered."""
+
+        if self.cfg.allow_files.refresh():
+            self.listed.clear()
+            self.sources.clear()
+
+    def allowed_source(self, ip):
+        """The allowlist an address is on: "allow" (the allow keys,
+        loopback included), "allow_file <path>", or ""."""
+
+        src = self.sources.get(ip)
+
+        if src is not None:
+            return src
+
+        src = ""
+
+        try:
+            addr = ipaddress.ip_address(ip)
+
+        except ValueError:
+            addr = None
+
+        if addr is not None:
+            if any(addr in net for net in self.cfg.allow):
+                src = "allow"
+
+            else:
+                for path, nets in self.cfg.allow_files.by_path:
+                    if any(addr in net for net in nets):
+                        src = "allow_file " + path
+                        break
+
+        if len(self.sources) > 65536:
+            self.sources.clear()
+
+        self.sources[ip] = src
+        return src
+
+    def listed_reason(self, ip):
+        """Why an address is never judged, or "". Cached: this runs for
+        every line, the allowlists only once per address."""
+
+        why = self.listed.get(ip)
+
+        if why is not None:
+            return why
+
+        try:
+            addr = ipaddress.ip_address(ip)
+
+        except ValueError:
+            why = "bad-address"
+
+        else:
+            nets = self.cfg.allow + self.cfg.allow_files.nets
+            why = "allow" if any(addr in net for net in nets) else ""
+
+        if len(self.listed) > 65536:
+            self.listed.clear()
+
+        self.listed[ip] = why
+        return why
+
+    def claim(self, ip, ua):
+        """Remember an address that sent a crawler's user agent. Only
+        those get the DNS check: a scanner with a browser's user agent is
+        banned without a lookup, so a reverse zone that never answers
+        cannot stall the loop for it."""
+
+        c = self.claim_ua.get(ua)
+
+        if c is None:
+            if len(self.claim_ua) > 65536:
+                self.claim_ua.clear()
+
+            c = self.claim_ua[ua] = bool(self.cfg.crawler_ua_rx.search(ua))
+
+        if c and ip not in self.claims:
+            if len(self.claims) > 65536:
+                self.claims.clear()
+
+            self.claims.add(ip)
+
+    def reason(self, ip):
+        """Checked only for an address that matched a rule. Counts made
+        before an allow_file reload are still excused; the DNS crawler
+        check is too slow to run per line, and runs only for an address
+        that claimed to be a crawler."""
+
+        why = self.listed_reason(ip)
+
+        if why or not self.cfg.crawler or ip not in self.claims:
+            return why
+
+        crawler = self.crawlers.get(ip)
+
+        if crawler is None:
+            crawler = self.is_crawler(ip)
+
+            if len(self.crawlers) > 65536:
+                self.crawlers.clear()
+
+            self.crawlers[ip] = crawler
+
+        return "crawler" if crawler else ""
+
+    def is_crawler(self, ip):
+        """Reverse DNS ends in a crawler domain, and that name resolves
+        back to ip. The user agent is not trusted."""
+
+        names, _ = self.lookup(ip)
+
+        for name in names:
+            if name.lower().endswith(tuple(self.cfg.crawler)):
+                _, back = self.lookup(name)
+
+                if ip in back:
+                    return True
+
+        return False
+
+    def lookup(self, name):
+        """self.resolve(name), given crawler_timeout seconds. A lookup
+        that does not answer in time is "not a crawler"; its thread is
+        left to finish on its own."""
+
+        out = []
+        t = threading.Thread(target=lambda: out.append(self.resolve(name)),
+                             daemon=True)
+        t.start()
+        t.join(self.cfg.crawler_timeout)
+
+        if out:
+            return out[0]
+
+        self.dns_timeouts += 1
+
+        if self.verbose:
+            warn("crawler check: %s timed out after %.1f s"
+                 % (name, self.cfg.crawler_timeout))
+
+        return [], set()
+
+
 class Judge:
 
     def __init__(self, cfg, act, out=sys.stdout, verbose=0,
@@ -1034,7 +1195,7 @@ class Judge:
         self.act = act
         self.out = out
         self.verbose = verbose
-        self.resolve = resolve or resolve_dns
+        self.exempt = Exempt(cfg, resolve or resolve_dns, verbose)
         self.win = Window(cfg.step, cfg.window // cfg.step)
         # (address, watch) -> [hits, 0, 0], moved with self.win
         self.watched = Window(cfg.step, cfg.window // cfg.step)
@@ -1045,11 +1206,6 @@ class Judge:
         self.cluster_agg = {}       # (ja4, ua) -> [addresses, total, costly]
         self.banned = {}            # ip -> until
         self.offenses = {}          # ip -> (count, when its ban ended)
-        self.listed = {}            # ip -> "allow", "bad-address" or ""
-        self.crawlers = {}          # ip -> verified crawler (DNS cache)
-        self.claims = set()         # ips whose user agent claimed a crawler
-        self.claim_ua = {}          # user agent -> claims (cache)
-        self.dns_timeouts = 0
         self.paths = {}             # path -> [count, backend seconds]
         self.timed = False
         self.lines = 0
@@ -1062,7 +1218,6 @@ class Judge:
         self.peaks = None           # dict: per-client peaks (--top-clients)
         self.ja4s = None            # dict: per-JA4 totals (--top-ja4)
         self.allowed = None         # dict: allowlisted traffic (--top-allowed)
-        self.sources = {}           # ip -> its allowlist, or "" (cache)
         self.explain = None         # Explain: one address (--explain)
 
     def feed(self, line):
@@ -1091,7 +1246,7 @@ class Judge:
             x.lines += 1
 
         if self.cfg.crawler:
-            self.claim(ip, ua)
+            self.exempt.claim(ip, ua)
 
         if self.allowed is not None:
             self.count_allowed(ip, path, cost)
@@ -1120,11 +1275,11 @@ class Judge:
 
         # An allowed address (a CDN edge) can never be banned: keep it in
         # the path report above, but out of the window.
-        if self.listed_reason(ip):
+        if self.exempt.listed_reason(ip):
             self.unjudged += 1
 
             if x:
-                x.listed(t, self.listed_reason(ip))
+                x.listed(t, self.exempt.listed_reason(ip))
             return
 
         costly = self.is_costly(path, cost)
@@ -1228,9 +1383,7 @@ class Judge:
     def judge(self, now):
         cfg = self.cfg
 
-        if cfg.allow_files.refresh():
-            self.listed.clear()
-            self.sources.clear()
+        self.exempt.refresh()
 
         if self.clusters is not None:
             agg = self.cluster_agg = {}
@@ -1267,7 +1420,7 @@ class Judge:
             if self.banned.get(ip, 0) > now:
                 continue
 
-            why = self.exempt_reason(ip)
+            why = self.exempt.reason(ip)
 
             if why:
                 if self.verbose:
@@ -1305,7 +1458,7 @@ class Judge:
             if self.banned.get(ip, 0) > now:
                 continue
 
-            why = self.exempt_reason(ip)
+            why = self.exempt.reason(ip)
 
             if why:
                 if self.verbose:
@@ -1341,7 +1494,7 @@ class Judge:
             if self.banned.get(ip, 0) > now:
                 continue
 
-            why = self.exempt_reason(ip)
+            why = self.exempt.reason(ip)
 
             if why:
                 if self.verbose:
@@ -1362,7 +1515,7 @@ class Judge:
         if self.banned.get(ip, 0) > now:
             return
 
-        why = self.exempt_reason(ip)
+        why = self.exempt.reason(ip)
 
         if why:
             if self.verbose:
@@ -1425,45 +1578,12 @@ class Judge:
                 or (cost is not None and self.cfg.slow_seconds > 0
                     and cost >= self.cfg.slow_seconds))
 
-    def allowed_source(self, ip):
-        """The allowlist an address is on: "allow" (the allow keys,
-        loopback included), "allow_file <path>", or ""."""
-
-        src = self.sources.get(ip)
-
-        if src is not None:
-            return src
-
-        src = ""
-
-        try:
-            addr = ipaddress.ip_address(ip)
-
-        except ValueError:
-            addr = None
-
-        if addr is not None:
-            if any(addr in net for net in self.cfg.allow):
-                src = "allow"
-
-            else:
-                for path, nets in self.cfg.allow_files.by_path:
-                    if any(addr in net for net in nets):
-                        src = "allow_file " + path
-                        break
-
-        if len(self.sources) > 65536:
-            self.sources.clear()
-
-        self.sources[ip] = src
-        return src
-
     def count_allowed(self, ip, path, cost):
         """--top-allowed: every line from an allowlisted address, a CDN
         edge say, honey probes and skipped paths included."""
 
         self.allowed["lines"] += 1
-        src = self.allowed_source(ip)
+        src = self.exempt.allowed_source(ip)
 
         if not src:
             return
@@ -1486,324 +1606,229 @@ class Judge:
         a[1] += 1
         a[2] += costly
 
-    def listed_reason(self, ip):
-        """Why an address is never judged, or "". Cached: this runs for
-        every line, the allowlists only once per address."""
-
-        why = self.listed.get(ip)
-
-        if why is not None:
-            return why
-
-        try:
-            addr = ipaddress.ip_address(ip)
-
-        except ValueError:
-            why = "bad-address"
-
-        else:
-            nets = self.cfg.allow + self.cfg.allow_files.nets
-            why = "allow" if any(addr in net for net in nets) else ""
-
-        if len(self.listed) > 65536:
-            self.listed.clear()
-
-        self.listed[ip] = why
-        return why
-
-    def claim(self, ip, ua):
-        """Remember an address that sent a crawler's user agent. Only
-        those get the DNS check: a scanner with a browser's user agent is
-        banned without a lookup, so a reverse zone that never answers
-        cannot stall the loop for it."""
-
-        c = self.claim_ua.get(ua)
-
-        if c is None:
-            if len(self.claim_ua) > 65536:
-                self.claim_ua.clear()
-
-            c = self.claim_ua[ua] = bool(self.cfg.crawler_ua_rx.search(ua))
-
-        if c and ip not in self.claims:
-            if len(self.claims) > 65536:
-                self.claims.clear()
-
-            self.claims.add(ip)
-
-    def exempt_reason(self, ip):
-        """Checked only for an address that matched a rule. Counts made
-        before an allow_file reload are still excused; the DNS crawler
-        check is too slow to run per line, and runs only for an address
-        that claimed to be a crawler."""
-
-        why = self.listed_reason(ip)
-
-        if why or not self.cfg.crawler or ip not in self.claims:
-            return why
-
-        crawler = self.crawlers.get(ip)
-
-        if crawler is None:
-            crawler = self.is_crawler(ip)
-
-            if len(self.crawlers) > 65536:
-                self.crawlers.clear()
-
-            self.crawlers[ip] = crawler
-
-        return "crawler" if crawler else ""
-
-    def is_crawler(self, ip):
-        """Reverse DNS ends in a crawler domain, and that name resolves
-        back to ip. The user agent is not trusted."""
-
-        names, _ = self.lookup(ip)
-
-        for name in names:
-            if name.lower().endswith(tuple(self.cfg.crawler)):
-                _, back = self.lookup(name)
-
-                if ip in back:
-                    return True
-
-        return False
-
-    def lookup(self, name):
-        """self.resolve(name), given crawler_timeout seconds. A lookup
-        that does not answer in time is "not a crawler"; its thread is
-        left to finish on its own."""
-
-        out = []
-        t = threading.Thread(target=lambda: out.append(self.resolve(name)),
-                             daemon=True)
-        t.start()
-        t.join(self.cfg.crawler_timeout)
-
-        if out:
-            return out[0]
-
-        self.dns_timeouts += 1
-
-        if self.verbose:
-            self.log("crawler check: %s timed out after %.1f s"
-                     % (name, self.cfg.crawler_timeout))
-
-        return [], set()
-
-    # --top-* reports: data first (for --json), then text from the data.
-
-    def top_paths(self, n):
-        """The paths that cost the backend most (or the most requested
-        ones when the log has no timing)."""
-
-        key = (lambda kv: kv[1][1]) if self.timed else (lambda kv: kv[1][0])
-        top = sorted(self.paths.items(), key=key, reverse=True)[:n]
-
-        return {"by": "backend_seconds" if self.timed else "requests",
-                "paths": [{"path": path, "requests": count,
-                           "backend_seconds": cost}
-                          for path, (count, cost) in top]}
-
-    def top_clients(self, n):
-        """The clients with the highest peak backend seconds in one
-        window, and percentiles over those this run did not ban: the
-        numbers to choose max_backend_seconds from."""
-
-        col = 0 if self.timed else 1
-        rows = sorted(self.peaks.items(), key=lambda kv: (-kv[1][col], kv[0]))
-        names = [p.name for p in self.cfg.profiles]
-
-        def rank(kept, q):
-            # nearest rank
-            return kept[max(0, math.ceil(len(kept) * q / 100) - 1)]
-
-        percentiles = {}
-
-        for pi, name in enumerate(names):
-            kept = sorted(pk[col] for (ip, i), pk in rows
-                          if i == pi and ip not in self.offenses)
-
-            if kept:
-                percentiles[name] = dict(
-                    [("clients", len(kept))]
-                    + [(label, rank(kept, q)) for label, q in
-                       (("p50", 50), ("p90", 90), ("p99", 99),
-                        ("p99.9", 99.9), ("max", 100))])
-
-        return {"by": "backend_seconds" if self.timed else "requests",
-                "window": self.cfg.window,
-                "clients": [{"address": ip, "profile": names[pi],
-                             "backend_seconds": pk[0],
-                             "workers": pk[0] / self.cfg.window,
-                             "requests": pk[1], "costly": pk[2],
-                             "all_requests": pk[3],
-                             "banned": ip in self.offenses}
-                            for (ip, pi), pk in rows[:n]],
-                "percentiles": percentiles}
-
-    def top_ja4(self, n):
-        """The JA4 fingerprints by requests, with the user agent each
-        one sends most. "" is requests without a fingerprint."""
-
-        rows = sorted(self.ja4s.items(), key=lambda kv: (-kv[1][0], kv[0]))
-        all_req = sum(j[0] for _, j in rows) or 1
-        out = []
-
-        for ja4, (req, cost, addrs, uas) in rows[:n]:
-            ua, count = uas.most_common(1)[0]
-            out.append({"ja4": ja4, "requests": req, "share": req / all_req,
-                        "addresses": len(addrs),
-                        "banned": len(addrs & self.offenses.keys()),
-                        "backend_seconds": cost, "top_user_agent": ua,
-                        "top_user_agent_requests": count})
-
-        return {"fingerprints": out}
-
-    def top_allowed(self, n):
-        """Allowlisted traffic, per allowlist, and its busiest
-        addresses: how much reaches the origin through a CDN."""
-
-        lines = self.allowed["lines"] or 1
-        ips = sorted(self.allowed["ips"].items(),
-                     key=lambda kv: (-kv[1][1], kv[0]))
-
-        return {"lines": self.allowed["lines"],
-                "sources": [{"source": src, "requests": st[0],
-                             "share": st[0] / lines, "addresses": len(st[3]),
-                             "costly": st[1], "backend_seconds": st[2]}
-                            for src, st in sorted(
-                                self.allowed["sources"].items(),
-                                key=lambda kv: -kv[1][0])],
-                "addresses": [{"address": ip, "source": a[0],
-                               "requests": a[1], "costly": a[2]}
-                              for ip, a in ips[:n]]}
-
-    def report_allowed(self, n, out=None):
-        out = out or self.out
-        data = self.top_allowed(n)
-        total = sum(s["requests"] for s in data["sources"])
-
-        out.write("\nallowlisted traffic, not judged: %d of %d lines, %.1f%%"
-                  "\n" % (total, data["lines"],
-                          total * 100 / (data["lines"] or 1)))
-
-        if not data["sources"]:
-            return
-
-        width = max(len(s["source"]) for s in data["sources"])
-        out.write("%-*s %9s %6s %9s %8s %10s\n"
-                  % (width, "source", "requests", "share", "addresses",
-                     "costly", "backend_s"))
-
-        for s in data["sources"]:
-            out.write("%-*s %9d %5.1f%% %9d %8d %10.1f\n"
-                      % (width, s["source"], s["requests"], s["share"] * 100,
-                         s["addresses"], s["costly"], s["backend_seconds"]))
-
-        width = max(len(a["address"]) for a in data["addresses"])
-        out.write("\n%3s  %-*s %9s %8s  %s\n"
-                  % ("#", width, "address", "requests", "costly", "source"))
-
-        for i, a in enumerate(data["addresses"], 1):
-            out.write("%3d  %-*s %9d %8d  %s\n"
-                      % (i, width, a["address"], a["requests"], a["costly"],
-                         a["source"]))
-
-    def report_paths(self, n, out=None):
-        out = out or self.out
-        data = self.top_paths(n)
-
-        out.write("\n%-10s %-12s %-9s path\n"
-                  % ("requests", "backend_s", "avg_ms"))
-
-        for p in data["paths"]:
-            out.write("%-10d %-12.1f %-9.1f %s\n"
-                      % (p["requests"], p["backend_seconds"],
-                         p["backend_seconds"] * 1000 / p["requests"],
-                         p["path"]))
-
-        if not self.timed:
-            out.write("(no rt=/urt= in the log: sorted by requests)\n")
-
-    def report_clients(self, n, out=None):
-        out = out or self.out
-        data = self.top_clients(n)
-        rows = data["clients"]
-        names = [p.name for p in self.cfg.profiles]
-        pw = max(len(n) for n in names)
-
-        out.write("\nclients by peak %s in one %d s window"
-                  " (allowlisted addresses are not judged, so not shown)\n"
-                  % ("backend seconds" if self.timed else "requests",
-                     self.cfg.window))
-
-        if rows:
-            width = max(len(r["address"]) for r in rows)
-            out.write("%3s  %-*s  %-*s %10s %8s %8s %8s %9s  %s\n"
-                      % ("#", width, "address", pw, "profile", "backend_s",
-                         "workers", "requests", "costly", "all_req",
-                         "banned"))
-
-        for i, r in enumerate(rows, 1):
-            out.write("%3d  %-*s  %-*s %10.1f %8.2f %8d %8d %9d  %s\n"
-                      % (i, width, r["address"], pw, r["profile"],
-                         r["backend_seconds"], r["workers"], r["requests"],
-                         r["costly"], r["all_requests"],
-                         "yes" if r["banned"] else ""))
-
-        out.write("\npeak %s per window, clients not banned:\n"
-                  % ("backend s" if self.timed else "requests"))
-
-        for name in names:
-            p = data["percentiles"].get(name)
-
-            if p:
-                out.write("  %-*s %7d clients  p50 %.1f  p90 %.1f  p99 %.1f"
-                          "  p99.9 %.1f  max %.1f\n"
-                          % (pw, name, p["clients"], p["p50"], p["p90"],
-                             p["p99"], p["p99.9"], p["max"]))
-
-        if not self.timed:
-            out.write("(no rt=/urt= in the log: requests, not backend"
-                      " seconds)\n")
-
-    def report_ja4(self, n, out=None):
-        out = out or self.out
-        rows = self.top_ja4(n)["fingerprints"]
-
-        out.write("\nJA4 fingerprints by requests (allowlisted addresses are"
-                  " not judged, so not counted)\n")
-
-        if not rows or (len(rows) == 1 and rows[0]["ja4"] == ""):
-            out.write("(no ja4= in the log)\n")
-            return
-
-        out.write("%3s  %-36s %9s %6s %9s %6s %10s  %s\n"
-                  % ("#", "ja4", "requests", "share", "addresses", "banned",
-                     "backend_s", "top user agent"))
-
-        for i, r in enumerate(rows, 1):
-            out.write("%3d  %-36s %9d %5.1f%% %9d %6d %10.1f  %d%% %s\n"
-                      % (i, r["ja4"] or "(none)", r["requests"],
-                         r["share"] * 100, r["addresses"], r["banned"],
-                         r["backend_seconds"],
-                         r["top_user_agent_requests"] * 100 // r["requests"],
-                         (r["top_user_agent"] or "-")[:48]))
-
-        # Commented out: pasting them all would give whatever else is in
-        # the log, an attacker's script included, the app's limits.
-        out.write("\n# Uncomment only your app's fingerprints; lines with one"
-                  " name OR.\n")
-
-        for r in rows:
-            if r["ja4"]:
-                out.write("# profile app = ja4:^%s$    # %d banned, %s\n"
-                          % (r["ja4"], r["banned"],
-                             (r["top_user_agent"] or "-")[:48]))
-
     def log(self, msg):
         warn(msg)
+
+
+# --top-* reports: data first (for --json), then text from the data.
+
+
+
+def top_paths(judge, n):
+    """The paths that cost the backend most (or the most requested
+    ones when the log has no timing)."""
+
+    key = (lambda kv: kv[1][1]) if judge.timed else (lambda kv: kv[1][0])
+    top = sorted(judge.paths.items(), key=key, reverse=True)[:n]
+
+    return {"by": "backend_seconds" if judge.timed else "requests",
+            "paths": [{"path": path, "requests": count,
+                       "backend_seconds": cost}
+                      for path, (count, cost) in top]}
+
+
+def top_clients(judge, n):
+    """The clients with the highest peak backend seconds in one
+    window, and percentiles over those this run did not ban: the
+    numbers to choose max_backend_seconds from."""
+
+    col = 0 if judge.timed else 1
+    rows = sorted(judge.peaks.items(), key=lambda kv: (-kv[1][col], kv[0]))
+    names = [p.name for p in judge.cfg.profiles]
+
+    def rank(kept, q):
+        # nearest rank
+        return kept[max(0, math.ceil(len(kept) * q / 100) - 1)]
+
+    percentiles = {}
+
+    for pi, name in enumerate(names):
+        kept = sorted(pk[col] for (ip, i), pk in rows
+                      if i == pi and ip not in judge.offenses)
+
+        if kept:
+            percentiles[name] = dict(
+                [("clients", len(kept))]
+                + [(label, rank(kept, q)) for label, q in
+                   (("p50", 50), ("p90", 90), ("p99", 99),
+                    ("p99.9", 99.9), ("max", 100))])
+
+    return {"by": "backend_seconds" if judge.timed else "requests",
+            "window": judge.cfg.window,
+            "clients": [{"address": ip, "profile": names[pi],
+                         "backend_seconds": pk[0],
+                         "workers": pk[0] / judge.cfg.window,
+                         "requests": pk[1], "costly": pk[2],
+                         "all_requests": pk[3],
+                         "banned": ip in judge.offenses}
+                        for (ip, pi), pk in rows[:n]],
+            "percentiles": percentiles}
+
+
+def top_ja4(judge, n):
+    """The JA4 fingerprints by requests, with the user agent each
+    one sends most. "" is requests without a fingerprint."""
+
+    rows = sorted(judge.ja4s.items(), key=lambda kv: (-kv[1][0], kv[0]))
+    all_req = sum(j[0] for _, j in rows) or 1
+    out = []
+
+    for ja4, (req, cost, addrs, uas) in rows[:n]:
+        ua, count = uas.most_common(1)[0]
+        out.append({"ja4": ja4, "requests": req, "share": req / all_req,
+                    "addresses": len(addrs),
+                    "banned": len(addrs & judge.offenses.keys()),
+                    "backend_seconds": cost, "top_user_agent": ua,
+                    "top_user_agent_requests": count})
+
+    return {"fingerprints": out}
+
+
+def top_allowed(judge, n):
+    """Allowlisted traffic, per allowlist, and its busiest
+    addresses: how much reaches the origin through a CDN."""
+
+    lines = judge.allowed["lines"] or 1
+    ips = sorted(judge.allowed["ips"].items(),
+                 key=lambda kv: (-kv[1][1], kv[0]))
+
+    return {"lines": judge.allowed["lines"],
+            "sources": [{"source": src, "requests": st[0],
+                         "share": st[0] / lines, "addresses": len(st[3]),
+                         "costly": st[1], "backend_seconds": st[2]}
+                        for src, st in sorted(
+                            judge.allowed["sources"].items(),
+                            key=lambda kv: -kv[1][0])],
+            "addresses": [{"address": ip, "source": a[0],
+                           "requests": a[1], "costly": a[2]}
+                          for ip, a in ips[:n]]}
+
+
+def report_allowed(judge, n, out=None):
+    out = out or judge.out
+    data = top_allowed(judge, n)
+    total = sum(s["requests"] for s in data["sources"])
+
+    out.write("\nallowlisted traffic, not judged: %d of %d lines, %.1f%%"
+              "\n" % (total, data["lines"],
+                      total * 100 / (data["lines"] or 1)))
+
+    if not data["sources"]:
+        return
+
+    width = max(len(s["source"]) for s in data["sources"])
+    out.write("%-*s %9s %6s %9s %8s %10s\n"
+              % (width, "source", "requests", "share", "addresses",
+                 "costly", "backend_s"))
+
+    for s in data["sources"]:
+        out.write("%-*s %9d %5.1f%% %9d %8d %10.1f\n"
+                  % (width, s["source"], s["requests"], s["share"] * 100,
+                     s["addresses"], s["costly"], s["backend_seconds"]))
+
+    width = max(len(a["address"]) for a in data["addresses"])
+    out.write("\n%3s  %-*s %9s %8s  %s\n"
+              % ("#", width, "address", "requests", "costly", "source"))
+
+    for i, a in enumerate(data["addresses"], 1):
+        out.write("%3d  %-*s %9d %8d  %s\n"
+                  % (i, width, a["address"], a["requests"], a["costly"],
+                     a["source"]))
+
+
+def report_paths(judge, n, out=None):
+    out = out or judge.out
+    data = top_paths(judge, n)
+
+    out.write("\n%-10s %-12s %-9s path\n"
+              % ("requests", "backend_s", "avg_ms"))
+
+    for p in data["paths"]:
+        out.write("%-10d %-12.1f %-9.1f %s\n"
+                  % (p["requests"], p["backend_seconds"],
+                     p["backend_seconds"] * 1000 / p["requests"],
+                     p["path"]))
+
+    if not judge.timed:
+        out.write("(no rt=/urt= in the log: sorted by requests)\n")
+
+
+def report_clients(judge, n, out=None):
+    out = out or judge.out
+    data = top_clients(judge, n)
+    rows = data["clients"]
+    names = [p.name for p in judge.cfg.profiles]
+    pw = max(len(n) for n in names)
+
+    out.write("\nclients by peak %s in one %d s window"
+              " (allowlisted addresses are not judged, so not shown)\n"
+              % ("backend seconds" if judge.timed else "requests",
+                 judge.cfg.window))
+
+    if rows:
+        width = max(len(r["address"]) for r in rows)
+        out.write("%3s  %-*s  %-*s %10s %8s %8s %8s %9s  %s\n"
+                  % ("#", width, "address", pw, "profile", "backend_s",
+                     "workers", "requests", "costly", "all_req",
+                     "banned"))
+
+    for i, r in enumerate(rows, 1):
+        out.write("%3d  %-*s  %-*s %10.1f %8.2f %8d %8d %9d  %s\n"
+                  % (i, width, r["address"], pw, r["profile"],
+                     r["backend_seconds"], r["workers"], r["requests"],
+                     r["costly"], r["all_requests"],
+                     "yes" if r["banned"] else ""))
+
+    out.write("\npeak %s per window, clients not banned:\n"
+              % ("backend s" if judge.timed else "requests"))
+
+    for name in names:
+        p = data["percentiles"].get(name)
+
+        if p:
+            out.write("  %-*s %7d clients  p50 %.1f  p90 %.1f  p99 %.1f"
+                      "  p99.9 %.1f  max %.1f\n"
+                      % (pw, name, p["clients"], p["p50"], p["p90"],
+                         p["p99"], p["p99.9"], p["max"]))
+
+    if not judge.timed:
+        out.write("(no rt=/urt= in the log: requests, not backend"
+                  " seconds)\n")
+
+
+def report_ja4(judge, n, out=None):
+    out = out or judge.out
+    rows = top_ja4(judge, n)["fingerprints"]
+
+    out.write("\nJA4 fingerprints by requests (allowlisted addresses are"
+              " not judged, so not counted)\n")
+
+    if not rows or (len(rows) == 1 and rows[0]["ja4"] == ""):
+        out.write("(no ja4= in the log)\n")
+        return
+
+    out.write("%3s  %-36s %9s %6s %9s %6s %10s  %s\n"
+              % ("#", "ja4", "requests", "share", "addresses", "banned",
+                 "backend_s", "top user agent"))
+
+    for i, r in enumerate(rows, 1):
+        out.write("%3d  %-36s %9d %5.1f%% %9d %6d %10.1f  %d%% %s\n"
+                  % (i, r["ja4"] or "(none)", r["requests"],
+                     r["share"] * 100, r["addresses"], r["banned"],
+                     r["backend_seconds"],
+                     r["top_user_agent_requests"] * 100 // r["requests"],
+                     (r["top_user_agent"] or "-")[:48]))
+
+    # Commented out: pasting them all would give whatever else is in
+    # the log, an attacker's script included, the app's limits.
+    out.write("\n# Uncomment only your app's fingerprints; lines with one"
+              " name OR.\n")
+
+    for r in rows:
+        if r["ja4"]:
+            out.write("# profile app = ja4:^%s$    # %d banned, %s\n"
+                      % (r["ja4"], r["banned"],
+                         (r["top_user_agent"] or "-")[:48]))
 
 
 def resolve_dns(name):
@@ -2175,16 +2200,16 @@ def main(argv=None):
                             judge.unjudged, judge.honey_hits))
 
     reports = [(n, data, text) for n, data, text in
-               ((args.top_paths, judge.top_paths, judge.report_paths),
-                (args.top_clients, judge.top_clients, judge.report_clients),
-                (args.top_ja4, judge.top_ja4, judge.report_ja4),
-                (args.top_allowed, judge.top_allowed, judge.report_allowed))
+               ((args.top_paths, top_paths, report_paths),
+                (args.top_clients, top_clients, report_clients),
+                (args.top_ja4, top_ja4, report_ja4),
+                (args.top_allowed, top_allowed, report_allowed))
                if n]
 
     # One JSON object holds the bans and the reports.
     if args.review and args.json:
         return review(judge, sys.stdout, True, {
-            data.__name__: data(n) for n, data, _ in reports})
+            data.__name__: data(judge, n) for n, data, _ in reports})
 
     if args.explain:
         judge.explain.summary()
@@ -2195,7 +2220,7 @@ def main(argv=None):
     # To stdout, after the bans: the replay's own output stream is
     # discarded by --review and --explain.
     for n, _, text in reports:
-        text(n, sys.stdout)
+        text(judge, n, sys.stdout)
 
     return 0
 

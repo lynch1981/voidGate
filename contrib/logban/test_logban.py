@@ -282,7 +282,7 @@ class JudgeTest(unittest.TestCase):
                                         urt="0.5"))
         out = io.StringIO()
         judge.out = out
-        judge.report_paths(5)
+        logban.report_paths(judge, 5)
         self.assertIn("/search", out.getvalue())
         self.assertIn("200", out.getvalue())
 
@@ -764,7 +764,7 @@ class TopClientsTest(unittest.TestCase):
             judge.feed(s)
 
         judge.finish()
-        judge.report_clients(n)
+        logban.report_clients(judge, n)
         return judge, out.getvalue()
 
     def test_peaks(self):
@@ -817,7 +817,7 @@ class TopClientsTest(unittest.TestCase):
                       bot("198.51.100.1", n=40, path="/", rt="0.1",
                           urt="0.1"))
         judge, text = self.report(lines)
-        data = judge.top_clients(10)
+        data = logban.top_clients(judge, 10)
 
         self.assertEqual([c["address"] for c in data["clients"]],
                          ["203.0.113.7", "198.51.100.1"])
@@ -966,7 +966,7 @@ class ProfileTest(unittest.TestCase):
             judge.feed(s)
 
         judge.finish()
-        judge.report_clients(10)
+        logban.report_clients(judge, 10)
         text = out.getvalue()
 
         self.assertEqual(sorted(judge.peaks),
@@ -1073,7 +1073,7 @@ class Ja4Test(unittest.TestCase):
             judge.feed(s)
 
         judge.finish()
-        judge.report_ja4(n)
+        logban.report_ja4(judge, n)
         return judge, out.getvalue()
 
     def test_top_ja4(self):
@@ -2102,7 +2102,7 @@ class CrawlerTest(unittest.TestCase):
 
         self.assertEqual(len(judge.act.calls), 3)
         self.assertLess(elapsed, 1.5)
-        self.assertEqual(judge.dns_timeouts, 3)
+        self.assertEqual(judge.exempt.dns_timeouts, 3)
         self.assertIn("crawler check: 203.0.113.0 timed out after 0.2 s",
                       err.getvalue())
 
@@ -2113,12 +2113,13 @@ class CrawlerTest(unittest.TestCase):
         for s in bot("203.0.113.7", n=5) + bot("66.249.66.1", n=5, ua=GBOT):
             judge.feed(s)
 
-        self.assertEqual(judge.claims, {"66.249.66.1"})
-        self.assertEqual(judge.claim_ua, {"Mozilla/5.0": False, GBOT: True})
+        self.assertEqual(judge.exempt.claims, {"66.249.66.1"})
+        self.assertEqual(judge.exempt.claim_ua,
+                         {"Mozilla/5.0": False, GBOT: True})
 
         # no crawler list: nothing is tracked
         _, _, judge = run(config(), bot("66.249.66.1", n=5, ua=GBOT))
-        self.assertEqual(judge.claims, set())
+        self.assertEqual(judge.exempt.claims, set())
 
     def test_config(self):
         cfg = ConfigTest.load(self, "costly = x\ncrawler = example.com\n"
@@ -2316,7 +2317,7 @@ class AllowedTest(unittest.TestCase):
             judge.feed(s)
 
         judge.finish()
-        data = judge.top_allowed(2)
+        data = logban.top_allowed(judge, 2)
         cdn = "allow_file " + self.cdn
 
         self.assertEqual(data["lines"], 152)
@@ -2332,7 +2333,7 @@ class AllowedTest(unittest.TestCase):
                           ("173.245.48.10", 30, cdn)])
 
         out = io.StringIO()
-        judge.report_allowed(2, out)
+        logban.report_allowed(judge, 2, out)
         text = out.getvalue()
         self.assertIn("allowlisted traffic, not judged: 102 of 152 lines,"
                       " 67.1%", text)
@@ -2356,7 +2357,8 @@ class AllowedTest(unittest.TestCase):
             sys.stderr = stderr
 
         # judged now, no longer counted as allowlisted
-        self.assertEqual(judge.top_allowed(5)["sources"][0]["requests"], 1)
+        self.assertEqual(
+            logban.top_allowed(judge, 5)["sources"][0]["requests"], 1)
         self.assertIn(("173.245.48.9", 0), judge.win.totals)
 
     def test_off_by_default(self):
