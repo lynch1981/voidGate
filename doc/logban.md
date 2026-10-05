@@ -98,8 +98,10 @@ refused.
  │  Window: per (address, profile) [total, costly, backend s]     │
  │  and per (address, watch) [hits] (§5.7)                        │
  │  and per (ja4, ua, address) [total, costly] (§5.8)             │
+ │  and the site's [requests, backend s] (§5.9)                   │
  │                     │ every step (10 s, over 60 s)             │
  │                     ▼                                          │
+ │  attack mode? (§5.9) ──▶ tighter min_costly, backend           │
  │  Judge: ratio | backend | watch | cluster ──▶ crawler? (§6.3)  │
  │                     │                                          │
  │                     ▼                                          │
@@ -526,6 +528,61 @@ but not its TLS stack, and one real user on the bots' stack):
 and passes. Real users of an uncommon stack who only hit costly paths
 look like a botnet; keep `ttl` short.
 
+### 5.9 Attack mode
+
+The thresholds above are set for a normal day, high enough that no real
+client reaches them. During an attack the site has less room: a bot at
+60 searches a minute stays under `min_costly = 100` while it and its
+peers keep the backend saturated. Attack mode lowers the volume
+thresholds while the whole site is under load, and only then:
+
+```
+attack_requests = 20000           # site requests in one window; 0 = off
+attack_backend_seconds = 0        # site backend seconds in one window; 0 = off
+attack_hold = 300                 # stays on this long after the last step over
+attack_scale = 0.5                # min_costly and max_backend_seconds times this
+```
+
+- **The signal is the log itself.** Every step, the site's requests and
+  backend seconds over the window are compared with the two thresholds;
+  either one turns the mode on. They are counted from every line that
+  reached the backend: allowlisted and skipped requests included (a CDN's
+  traffic is load too), banned clients left out (live, XDP drops them,
+  so a replay must not count them either). Off, nothing is counted.
+- **What tightens.** Every profile's `min_costly` (rounded up, at least
+  1) and `max_backend_seconds` are multiplied by `attack_scale`.
+  **The ratio is never scaled:** it is what lets browsers, CGNAT and
+  office addresses pass (§5.3), and under load their mix of pages and
+  assets is unchanged. A browser does not become a bot because the site
+  is busy, so attack mode bans more bots, sooner, not more browsers.
+- **What does not.** Watches, honey paths and clusters keep their
+  thresholds: they recognise a behaviour, not a volume.
+- **Per profile.** `<name>.attack_scale` overrides it, like the other
+  profile keys (§5.4). An app's users are judged by
+  `max_backend_seconds` alone; `api.attack_scale = 1` keeps their limit
+  when the site is busy, at the cost of a bot forging the app's user
+  agent getting it too.
+- **Hysteresis.** The mode stays on `attack_hold` seconds after the last
+  step over a threshold. Its own bans bring the load down; without the
+  hold it would switch off, the bots return when their ttl ends, and it
+  switches on again.
+- **Visible.** stdout gets `attack on` and `attack off` lines with the
+  site's counts (§10), `--explain` an `attack` row, and a ban that only
+  the tighter thresholds fired ends in `mode=attack`, also in
+  `--review`'s `details`. Those are the bans to check for false
+  positives.
+- **Choosing the thresholds.** `--top-clients` prints the site's peak
+  per window over the replay (§10). Run it on a normal week and set
+  `attack_requests` or `attack_backend_seconds` well above that peak:
+  a threshold the site reaches on an ordinary evening makes every evening
+  an attack.
+
+**Limits.** With `slow_seconds`, a slow backend makes more requests
+costly for everyone (§15), raising browsers' ratios just when the
+thresholds drop; prefer `costly` regexes on a site that uses attack
+mode. A NAT address is the first legitimate client a halved
+`max_backend_seconds` reaches (§5.3).
+
 ## 6. Exemptions
 
 | Exemption | Checked | Matches |
@@ -874,6 +931,16 @@ error, and a refusal then `retry_after=<ttl>s` (§7.2):
 2026-10-03T10:00:20Z ban 198.51.100.10 ttl=600 ... rule=ratio error="error: refused or map update failed" retry_after=600s
 ```
 
+While attack mode (§5.9) is on, a ban that only its tighter
+thresholds fired ends in `mode=attack`. Its switches are lines of their
+own, with the site's counts over the window. From
+`data/clickHouse.access.log` with `attack_requests = 3000`:
+
+```
+2025-10-21T10:34:40Z attack on requests=3090 backend=3724.6s
+2025-10-21T11:04:30Z attack off requests=1 backend=0.6s
+```
+
 stderr:
 
 | Line | When |
@@ -909,6 +976,14 @@ banned, per profile, which is what to choose that profile's
 
 peak backend s per window, clients not banned:
   default    3001 clients  p50 6.4  p90 8.8  p99 11.2  p99.9 13.6  max 146.0
+```
+
+Then the whole site's peak in one window, what to set the attack mode
+thresholds above (§5.9); in `-r --json`, `top_clients.site`. From
+`data/clickHouse.access.log`:
+
+```
+site peak per window, banned clients left out: 3090 requests, 3724.6 backend s (62.08 workers)
 ```
 
 `--top-ja4 N` prints the N most used JA4 fingerprints: requests, share,
@@ -982,6 +1057,8 @@ version before each feature.
 | `--top-clients` | about 30 % more: peaks updated every step |
 | a log without `ja4=` | no cost: the field is searched only when present |
 | `--top-allowed` off | no cost |
+| attack mode off (§5.9) | no cost |
+| attack mode on | about 4 % more: two sums per line, measured on `data/clickHouse.access.log` ten times over |
 
 A busy single VM logs far fewer lines per second. Past that rate, run it
 under PyPy, or sample the log.
@@ -1158,6 +1235,7 @@ integration scripts.
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; ttls above `max_ttl` capped with a warning, honey escalating from 900 once `max_ttl` is raised, no default above another (600, 900, 900); offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ExplainTest` | under, fires and BAN rows with their times, folded banned steps, summary; the same bans as a normal run; `under:` reasons (costly share, backend); allowlisted: never judged; verified crawler: exempt; honey, skipped, two profiles and a watch in one replay; watch ratio reason; not in the log; CLI: IPv6 normalized, the config's socket never used, bad address, refused with `-f` and `--review` |
 | `ClusterTest` | a 30-address botnet each under every threshold: no ban by per-address rules, all banned by the cluster, ban line with size, ja4 and ua; user agent alone without `ja4=`; 50 browsers on one stack pass; search-only users inside a browser cluster pass; a member that browses and one with 2 costly requests pass; below `cluster_min_addresses`, below `cluster_min_costly`, spread over 10 minutes; ratio-off profiles not clustered; allowlisted not counted, verified crawlers not banned; off by default; `--explain` rows; config bounds only when on. Each of the three safety conditions was removed in turn and a test failed. |
+| `AttackTest` | off by default, nothing counted; site load turns it on: a slow bot under `min_costly` banned with `mode=attack` while browsers pass, nothing below the threshold; a bot the normal thresholds catch is not tagged; `attack_hold` and a hold of 0, switches logged with their times; by backend seconds; banned clients not counted as load; `<name>.attack_scale = 1` keeps an app's limit; scaled limits rounded up, at least 1; config defaults and bounds; `--explain` rows; the site peak in `--top-clients`, text and JSON |
 | `JsonTest` | the same tuple as `combined` for the same request; `urt` with several upstreams, `-` falling back to `rt`, both absent; `ja4` from either name, `-` as none; `time_iso8601` with offsets and `msec` as string or number; `request_method` + `request_uri`; unparsed (cut short, no address, bad or wrong-typed time); `json_*` keys; the same bans in each format and mixed in one file; every line of the `data/` sample parses |
 | `TimeTest` | the `time_local` fast path equals `strptime` (also checked on 20,000 random stamps and offsets while writing it); out-of-range and misshapen stamps rejected |
 | `DataTest` | replays of `data/` (§17): with a copy of `data/me.conf` as committed (editing the file to experiment does not break it), 261 addresses banned, all by honey, no Cloudflare edge, no address that loaded the game, over 70 % of requests dropped, `80.94.95.211` banned before its `.git` downloads; without the Cloudflare allowlist, over 100 edges banned; the generated JSON sample parses whole and bans nothing |

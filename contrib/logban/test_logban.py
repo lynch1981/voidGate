@@ -1774,6 +1774,169 @@ class ClusterTest(unittest.TestCase):
         ConfigTest.load(self, "costly = x\ncluster_ratio = 5\n")
 
 
+def crowd(n=20, start=T0):
+    """n browsers for 40 s: 1000 requests in the first 10 s."""
+
+    return merge(*[browser("198.51.100.%d" % (i + 1), start=start)
+                   for i in range(n)])
+
+
+def slow_bot(ip="203.0.113.7", start=T0):
+    """60 searches in a minute: under min_costly 100, over 50."""
+
+    return bot(ip, n=60, start=start, every=1)
+
+
+def ticker(until=T0 + 600):
+    """One cheap request every 5 s: keeps the clock moving."""
+
+    return bot("192.0.2.200", n=int((until - T0) // 5), path="/", every=5)
+
+
+class AttackTest(unittest.TestCase):
+
+    def test_off_by_default(self):
+        act, out, judge = run(config(), merge(crowd(), slow_bot()))
+        self.assertIsNone(judge.load)
+        self.assertEqual(act.calls, [])
+        self.assertNotIn("attack", out)
+
+    def test_tightens_under_load(self):
+        act, out, judge = run(config(attack_requests=1000),
+                              merge(crowd(), slow_bot()))
+
+        # only the bot: the browsers' ratio is not scaled
+        self.assertEqual(act.calls, [("203.0.113.7", 60)])
+        self.assertIn("%s attack on requests=1010 backend=0.0s"
+                      % logban.iso(T0 + 10), out)
+        self.assertRegex(out, r"ban 203\.0\.113\.7 .* rule=ratio"
+                              r" mode=attack\n")
+
+        # the site peaks at 4060 (the window at T0+60): never on
+        act, out, _ = run(config(attack_requests=4061),
+                          merge(crowd(), slow_bot()))
+        self.assertEqual(act.calls, [])
+        self.assertNotIn("attack", out)
+
+    def test_untagged_when_normal_thresholds_fire(self):
+        _, out, _ = run(config(attack_requests=1000),
+                        merge(crowd(), bot("203.0.113.8", every=0.1)))
+        self.assertRegex(out, r"ban 203\.0\.113\.8 .* rule=ratio\n")
+        self.assertNotIn("mode=attack", out)
+
+    def test_hold(self):
+        # over at every step until T0+90 (the crowd's last 10 s still
+        # in the window), under from T0+100
+        for hold, off in ((300, T0 + 390), (0, T0 + 100)):
+            _, out, judge = run(config(attack_requests=1000,
+                                       attack_hold=hold),
+                                merge(crowd(), ticker()))
+            rows = [r for r in out.splitlines() if " attack " in r]
+            self.assertEqual(len(rows), 2, hold)
+            self.assertTrue(rows[0].startswith(logban.iso(T0 + 10)
+                                               + " attack on"), rows)
+            self.assertTrue(rows[1].startswith(logban.iso(off)
+                                               + " attack off"), rows)
+            self.assertFalse(judge.attack)
+
+    def test_backend_seconds(self):
+        heavy = merge(*[bot("198.51.100.%d" % i, n=100, path="/", rt="1",
+                            urt="1") for i in (1, 2, 3)])
+        cfg = config(attack_backend_seconds=150)
+        _, out, judge = run(cfg, merge(heavy, slow_bot()))
+        self.assertIn("%s attack on requests=160 backend=150.0s"
+                      % logban.iso(T0 + 10), out)
+        self.assertIn("mode=attack", out)
+        # its backend rule is off (0): scaled, still off
+        self.assertEqual(cfg.profiles[0].limits(True), (50, 0.0))
+
+    def test_banned_not_counted(self):
+        # banned at T0+20 for 60 s: its next 300 lines reach no backend
+        _, _, judge = run(config(attack_requests=10 ** 6),
+                          bot("203.0.113.7", n=1000))
+        self.assertEqual(judge.load.peak, [100, 0.0])
+        self.assertFalse(judge.attack)
+
+    def test_profile_opts_out(self):
+        # an app at 18 backend s per window: under api's 30, over 15
+        lines = app("198.51.100.20", n=600, urt="0.06")
+
+        for kw, banned in (({}, True), ({"api.attack_scale": 1}, False)):
+            cfg = api_config(attack_requests=200, **kw)
+            act, out, _ = run(cfg, lines)
+            self.assertEqual(bool(act.calls), banned, kw)
+
+            if banned:
+                self.assertIn("rule=api.backend mode=attack", out)
+
+        # the app alone, without attack mode: not banned
+        act, _, _ = run(api_config(), lines)
+        self.assertEqual(act.calls, [])
+
+    def test_limits(self):
+        cfg = api_config(min_costly=99, attack_scale=0.3)
+        default, api = cfg.profiles
+        self.assertEqual(default.limits(False), (99, 0.0))
+        self.assertEqual(default.limits(True), (30, 0.0))      # ceil
+        self.assertEqual(api.limits(True), (30, 9.0))
+        self.assertEqual(api_config(min_costly=1, attack_scale=0.1)
+                         .profiles[0].limits(True)[0], 1)
+
+    def test_config(self):
+        cfg = ConfigTest.load(self, "costly = x\n")
+        self.assertEqual((cfg.attack_requests, cfg.attack_backend_seconds,
+                          cfg.attack_hold, cfg.attack_scale, cfg.attack),
+                         (0, 0.0, 300, 0.5, False))
+        cfg = ConfigTest.load(self, "costly = x\nattack_requests = 5000\n")
+        self.assertTrue(cfg.attack)
+
+        for text in ("attack_scale = 0\n", "attack_scale = 1.5\n",
+                     "attack_requests = -1\n", "attack_hold = -1\n",
+                     "attack_backend_seconds = -1\n",
+                     "profile api = ua:x\napi.max_backend_seconds = 9\n"
+                     "api.attack_scale = 2\n"):
+            with self.assertRaises(logban.ConfigError, msg=text):
+                ConfigTest.load(self, "costly = x\n" + text)
+
+    def test_explain(self):
+        out = io.StringIO()
+        judge = logban.Judge(config(attack_requests=1000), Recorder(),
+                             out=io.StringIO())
+        judge.explain = logban.Explain("203.0.113.7", judge, out)
+
+        for s in merge(crowd(), slow_bot()):
+            judge.feed(s)
+
+        judge.finish()
+        text = out.getvalue()
+        self.assertIn("attack       on requests=1010", text)
+        self.assertIn("under: costly 10 < min_costly 50", text)
+        self.assertIn("BAN          rule=ratio", text)
+
+    def test_top_clients_site_peak(self):
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "access.log")
+        conf = os.path.join(d, "logban.conf")
+
+        with open(log, "w") as f:
+            f.writelines(crowd())
+
+        with open(conf, "w") as f:
+            f.write("costly = ^/search\n")
+
+        # attack mode off: --top-clients still measures the site
+        code, out, _ = ExplainTest.main(self, "-n", "-c", conf,
+                                        "--top-clients", "1", log)
+        self.assertEqual(code, 0)
+        self.assertIn("site peak per window, banned clients left out:"
+                      " 4000 requests, 0.0 backend s", out)
+
+        code, out, _ = ExplainTest.main(self, "-r", "--json", "-c", conf,
+                                        "--top-clients", "1", log)
+        self.assertEqual(json.loads(out)["top_clients"]["site"],
+                         {"requests": 4000, "backend_seconds": 0.0})
+
+
 def jline(ip, t, path, method="GET", status=200, ua="Mozilla/5.0",
           rt=0.1, urt=0.1, **extra):
     """The same request as line(), the way log_format escape=json writes

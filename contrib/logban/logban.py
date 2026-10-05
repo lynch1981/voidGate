@@ -163,6 +163,7 @@ class Profile:
         "min_costly": int,
         "ratio": parse_ratio,
         "max_backend_seconds": float,
+        "attack_scale": float,
     }
     NAME = re.compile(r"[a-z][a-z0-9_]*")
     FIELDS = {"path": 0, "ua": 1, "ja4": 2}
@@ -192,37 +193,48 @@ class Profile:
         return (values[2] in self.ja4
                 or any(rx.search(values[i]) for i, rx in self.match))
 
-    def rule(self, total, costly, cost):
+    def limits(self, attack):
+        """(min_costly, max_backend_seconds), scaled in attack mode. The
+        ratio is never scaled: it is what lets browsers pass."""
+
+        if attack:
+            return (max(1, math.ceil(self.min_costly * self.attack_scale)),
+                    self.max_backend_seconds * self.attack_scale)
+
+        return self.min_costly, self.max_backend_seconds
+
+    def rule(self, total, costly, cost, attack=False):
         """The rule this window's counts fire, or None."""
 
-        if self.ratio is not None and costly >= self.min_costly \
+        min_costly, max_backend = self.limits(attack)
+
+        if self.ratio is not None and costly >= min_costly \
                 and costly >= self.ratio * total:
             return self.prefix + "ratio"
 
-        if self.max_backend_seconds > 0 and cost >= self.max_backend_seconds:
+        if max_backend > 0 and cost >= max_backend:
             return self.prefix + "backend"
 
         return None
 
-    def under(self, total, costly, cost):
+    def under(self, total, costly, cost, attack=False):
         """Why no rule fires, for --explain."""
 
+        min_costly, max_backend = self.limits(attack)
         why = []
 
         if self.ratio is None:
             why.append("ratio off")
 
-        elif costly < self.min_costly:
-            why.append("costly %d < min_costly %d" % (costly,
-                                                       self.min_costly))
+        elif costly < min_costly:
+            why.append("costly %d < min_costly %d" % (costly, min_costly))
 
         else:
             why.append("costly share %.2f < ratio %.2f"
                        % (costly / total, self.ratio))
 
-        if self.max_backend_seconds > 0:
-            why.append("backend %.1f s < %.1f s"
-                       % (cost, self.max_backend_seconds))
+        if max_backend > 0:
+            why.append("backend %.1f s < %.1f s" % (cost, max_backend))
 
         return "; ".join(why)
 
@@ -314,6 +326,14 @@ class Config:
         "cluster_min_costly": (int, 300),
         "cluster_ratio": (float, 0.9),
         "cluster_member_min": (int, 3),
+        # Attack mode: while the whole site's requests or backend seconds
+        # in the window reach a threshold (0 = off), and attack_hold
+        # seconds after, min_costly and max_backend_seconds are scaled
+        # by attack_scale. The ratio is not.
+        "attack_requests": (int, 0),
+        "attack_backend_seconds": (float, 0.0),
+        "attack_hold": (int, 300),
+        "attack_scale": (float, 0.5),
         # Only a client whose user agent claims to be a crawler gets the
         # DNS check, each lookup capped at crawler_timeout seconds.
         "crawler_ua": (str, r"(?i)bot|crawl|spider|slurp|google"),
@@ -483,6 +503,14 @@ class Config:
         if self.crawler_timeout <= 0:
             raise ConfigError("crawler_timeout must be above 0")
 
+        if min(self.attack_requests, self.attack_backend_seconds,
+               self.attack_hold) < 0:
+            raise ConfigError("attack_requests, attack_backend_seconds and"
+                              " attack_hold must be at least 0")
+
+        self.attack = (self.attack_requests > 0
+                       or self.attack_backend_seconds > 0)
+
         if self.honey and self.honey_ttl < 1:
             raise ConfigError("need honey_ttl >= 1")
 
@@ -555,6 +583,10 @@ class Config:
 
             if p.min_costly < 1:
                 raise ConfigError("%smin_costly must be at least 1"
+                                  % p.prefix)
+
+            if not 0 < p.attack_scale <= 1:
+                raise ConfigError("%sattack_scale must be in (0, 1]"
                                   % p.prefix)
 
             fire = ((p.ratio is not None and any_costly)
@@ -819,6 +851,41 @@ class Window:
                 b.pop(key, None)
 
 
+class Load:
+    """The whole site's requests and backend seconds over the last
+    `buckets` steps, moved with the Windows: attack mode reads it, and
+    --top-clients its peak."""
+
+    def __init__(self, buckets):
+        self.size = buckets
+        self.buckets = collections.deque()
+        self.requests = 0
+        self.cost = 0.0
+        self.peak = [0, 0.0]        # requests, backend s, at any step
+
+    def add(self, cost):
+        b = self.buckets[-1]
+        b[0] += 1
+        b[1] += cost
+        self.requests += 1
+        self.cost += cost
+
+    def push(self):
+        self.buckets.append([0, 0.0])
+
+        if len(self.buckets) > self.size:
+            requests, cost = self.buckets.popleft()
+            self.requests -= requests
+            # no float drift left behind once the window is empty
+            self.cost = self.cost - cost if self.requests else 0.0
+
+    def reset(self):
+        self.buckets.clear()
+        self.buckets.append([0, 0.0])
+        self.requests = 0
+        self.cost = 0.0
+
+
 def cluster_under(cfg, addresses, total, costly):
     """Why a fingerprint cluster does not fire, or "" when it does."""
 
@@ -949,11 +1016,13 @@ class Explain:
             pk = self.peaks.setdefault(pi, [0, 0, 0.0])
             pk[:] = [max(pk[0], total), max(pk[1], costly),
                      max(pk[2], cost)]
-            rule = p.rule(total, costly, cost)
+            attack = self.judge.attack
+            rule = p.rule(total, costly, cost, attack)
             self.row(now, p.name, "total=%d costly=%d backend=%.1fs  %s"
                      % (total, costly, cost,
                         self.verdict(now, rule) if rule
-                        else "under: " + p.under(total, costly, cost)))
+                        else "under: " + p.under(total, costly, cost,
+                                                 attack)))
 
         for wi, w in enumerate(cfg.watches):
             st = self.judge.watched.totals.get((self.ip, wi))
@@ -1204,6 +1273,10 @@ class Judge:
         self.clusters = (Window(cfg.step, cfg.window // cfg.step)
                          if cfg.cluster_min_addresses else None)
         self.cluster_agg = {}       # (ja4, ua) -> [addresses, total, costly]
+        # site-wide load; None unless attack mode is on (or --top-clients)
+        self.load = Load(cfg.window // cfg.step) if cfg.attack else None
+        self.attack = False         # attack mode now
+        self.attack_until = 0       # its hold ends
         self.banned = {}            # ip -> until
         self.offenses = {}          # ip -> (count, when its ban ended)
         self.paths = {}             # path -> [count, backend seconds]
@@ -1241,6 +1314,11 @@ class Judge:
             tr[2] += cost or 0.0
         self.clock(t)
         x = self.explain if self.explain and ip == self.explain.ip else None
+
+        # Everything that reaches the backend, allowlisted and skipped
+        # included; not a banned client: live, XDP drops it.
+        if self.load is not None and self.banned.get(ip, 0) <= t:
+            self.load.add(cost or 0.0)
 
         if x:
             x.lines += 1
@@ -1344,11 +1422,9 @@ class Judge:
 
         if win.cur is None:
             win.cur = idx
-            win.reset()
-            self.watched.reset()
 
-            if self.clusters is not None:
-                self.clusters.reset()
+            for w in self.windows():
+                w.reset()
             return
 
         if idx <= win.cur:
@@ -1357,22 +1433,24 @@ class Judge:
         if idx - win.cur > win.size:
             # A gap longer than the window: judge once, start over.
             self.judge((win.cur + 1) * self.cfg.step)
-            win.reset()
-            self.watched.reset()
 
-            if self.clusters is not None:
-                self.clusters.reset()
+            for w in self.windows():
+                w.reset()
             win.cur = idx
             return
 
         while win.cur < idx:
             win.cur += 1
             self.judge(win.cur * self.cfg.step)
-            win.push()
-            self.watched.push()
 
-            if self.clusters is not None:
-                self.clusters.push()
+            for w in self.windows():
+                w.push()
+
+    def windows(self):
+        """Everything that moves with the clock."""
+
+        return [w for w in (self.win, self.watched, self.clusters,
+                            self.load) if w is not None]
 
     def finish(self):
         """Judge the partial window at end of input."""
@@ -1399,6 +1477,9 @@ class Judge:
                 a[1] += total
                 a[2] += costly
 
+        if self.load is not None:
+            self.judge_load(now)
+
         if self.explain:
             self.explain.step(now)
 
@@ -1412,7 +1493,7 @@ class Judge:
                 pk[1] = max(pk[1], total)
                 pk[2] = max(pk[2], costly)
 
-            rule = p.rule(total, costly, cost)
+            rule = p.rule(total, costly, cost, self.attack)
 
             if rule is None:
                 continue
@@ -1428,13 +1509,50 @@ class Judge:
                              % (ip, why, total, costly))
                 continue
 
-            self.ban(ip, now, rule, total, costly, cost)
+            # Tagged when only the tighter thresholds fired, so a review
+            # can tell attack mode's bans from the rest.
+            self.ban(ip, now, rule, total, costly, cost,
+                     note=" mode=attack" if self.attack
+                     and p.rule(total, costly, cost) is None else "")
 
         if self.watched.totals:
             self.judge_watches(now)
 
         if self.cluster_agg:
             self.judge_clusters(now)
+
+    def judge_load(self, now):
+        """Attack mode: on while the site's load in the window is at an
+        attack_ threshold, and for attack_hold seconds after. The hold
+        keeps it on while its own bans bring the load down."""
+
+        cfg = self.cfg
+        load = self.load
+        load.peak[0] = max(load.peak[0], load.requests)
+        load.peak[1] = max(load.peak[1], load.cost)
+
+        if not cfg.attack:
+            return
+
+        over = (0 < cfg.attack_requests <= load.requests
+                or 0 < cfg.attack_backend_seconds <= load.cost)
+
+        if over:
+            self.attack_until = now + cfg.attack_hold
+
+        on = over or now < self.attack_until
+
+        if on == self.attack:
+            return
+
+        self.attack = on
+        text = "%s requests=%d backend=%.1fs" % ("on" if on else "off",
+                                                 load.requests, load.cost)
+        self.out.write("%s attack %s\n" % (iso(now), text))
+        self.out.flush()
+
+        if self.explain:
+            self.explain.row(now, "attack", text)
 
     def judge_clusters(self, now):
         """Many addresses, each under every per-address threshold, with
@@ -1662,7 +1780,11 @@ def top_clients(judge, n):
                          "all_requests": pk[3],
                          "banned": ip in judge.offenses}
                         for (ip, pi), pk in rows[:n]],
-            "percentiles": percentiles}
+            "percentiles": percentiles,
+            # the attack_ thresholds go above a normal week's peak
+            "site": {"requests": judge.load.peak[0],
+                     "backend_seconds": judge.load.peak[1]}
+            if judge.load else None}
 
 
 def top_ja4(judge, n):
@@ -1790,6 +1912,14 @@ def report_clients(judge, n, out=None):
                       "  p99.9 %.1f  max %.1f\n"
                       % (pw, name, p["clients"], p["p50"], p["p90"],
                          p["p99"], p["p99.9"], p["max"]))
+
+    site = data["site"]
+
+    if site:
+        out.write("\nsite peak per window, banned clients left out:"
+                  " %d requests, %.1f backend s (%.2f workers)\n"
+                  % (site["requests"], site["backend_seconds"],
+                     site["backend_seconds"] / judge.cfg.window))
 
     if not judge.timed:
         out.write("(no rt=/urt= in the log: requests, not backend"
@@ -2162,6 +2292,9 @@ def main(argv=None):
 
     if args.top_clients:
         judge.peaks = {}
+
+        if judge.load is None:
+            judge.load = Load(cfg.window // cfg.step)
 
     if args.top_ja4:
         judge.ja4s = {}
