@@ -40,6 +40,12 @@ pages, CSS, JS and images. A bot that floods `/search` loads nothing else.
 **Goal:** turn that observation into a per-address rule, apply it to the
 live log, and drop the offenders at XDP for a while.
 
+The same log shows two smaller attacks that cost little each but are
+just as easy to recognise: **scanning**, probes for paths the site never
+serves (`/.env`, `/.git`, admin panels), mostly answered 404 (§5.6,
+§5.7); and **password brute force**, one address posting to the login
+form again and again (§5.7). logban drops those too.
+
 ## 2. Scope
 
 In scope:
@@ -439,7 +445,7 @@ scan.max = 50
 scan.ratio = 0.5
 
 watch login = method:POST path:^/login$ status:401|403
-login.max = 20                                # credential stuffing
+login.max = 20                                # password brute force
 login.ttl = 900                               # straight to the cap
 
 watch throttled = status:429                  # limit_req said no
@@ -472,7 +478,7 @@ Notes for the three examples:
 | Watch | Note |
 |---|---|
 | `scan` | Fill `honey` first: it bans on one probe. `scan` catches the paths nobody listed. Keep the ratio: broken links are common. |
-| `login` | Only works if the app answers a failed login with 401, 403 or 422. Many answer 200 with an error page, or 302 back to the form, the same as a success; then the log cannot tell, and the app must rate-limit itself. |
+| `login` | Only works if the app answers a failed login with a status the watch lists (here 401 or 403; add others, such as 422, if the app uses them). Many answer 200 with an error page, or 302 back to the form, the same as a success; then drop `status:` and count every POST to the form with `login.ratio = 0.5`: nobody submits it 20 times a minute, and an office address, whose users also load pages, passes. Per address only: credential stuffing spread over many addresses, a few attempts each, is the app's to stop (§15). |
 | `throttled` | `limit_req` answers **503** unless `limit_req_status 429;` is set; match what your config sends. The client is already refused by nginx; this moves it to XDP, so its requests stop costing a TLS handshake and a parse. |
 
 A watch has no profile or JA4 condition: add one if a case needs it.
@@ -1185,6 +1191,10 @@ The offense counts are kept for every address ever banned (§15).
 
 Limits:
 
+- **Credential stuffing over many addresses.** A few login attempts
+  per address stay under any per-address watch, and the requests are
+  cheap, so clusters (§5.8) do not count them unless the login path is
+  `costly`. The app must limit attempts per account.
 - **Slow, wide botnets that impersonate a browser.** Clusters (§5.8)
   catch a botnet with its own fingerprint. One that copies a common
   browser's TLS stack and user agent hides among real users; that needs
@@ -1230,7 +1240,7 @@ integration scripts.
 | `TopClientsTest` | peak backend seconds, requests and all requests per client; workers column; percentiles over clients not banned; banned clients flagged; allowlisted clients absent; no timing falls back to requests; off unless asked; the report's data matches its text, JSON floats rounded |
 | `ProfileTest` | profile keys inherit and override; config errors (field, regex, name, reserved `default`, undeclared, bounds, a profile that cannot fire, all rules off); first declared wins, `ua:` and `path:`, no user agent; an app passes with `api.ratio = off` but the same traffic is banned without the profile; a forged user agent still banned by `api.backend`; one NAT address counted apart; a ban clears every profile's counters; `--top-clients` per profile |
 | `Ja4Test` | `ja4=` parsed, `-` / empty / missing as none, `ja4t=` ignored; exact fingerprints held as a set, other `ja4:` as regexes, exact means exact; known stacks pass while a script with the app's user agent and a plain-HTTP client are banned by `api_other`; a copied fingerprint banned by `app.backend`; `--top-ja4` columns, share, banned count, commented paste lines that load once uncommented; no `ja4=` in the log; off unless asked |
-| `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; `throttled` on 429; OR lines and a status regex, `ttl`; spaces or tabs in `watch <name>` and `profile <name>`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved names (`honey`, `cluster`) and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
+| `WatchTest` | method and status parsed, empty method for a malformed request; `scan` at `max` and below it; the window slides; `ratio` lets a NAT with missing images pass and bans a scanner; `login` counts POST 401 and 403, not GET, 200, 422 or another path; without `status:`, every POST, its ratio banning a brute-forcer answered 200 and passing an office that also loads pages, which is banned without it; `throttled` on 429; OR lines and a status regex, `ttl`; spaces or tabs in `watch <name>` and `profile <name>`; allowlisted and skipped requests not counted; a verified crawler not banned; one ban clears every counter; a refusal held; config: values, watch-only and honey-only configs, errors (no or zero `max`, unknown field, empty condition, bad regex, reserved names (`honey`, `cluster`) and bad names, undeclared, profile key on a watch and watch key on a profile, a name used for both, `ttl` and `ratio` bounds) |
 | `CrawlerTest` | no lookup for clients with a browser's user agent; a fake Googlebot looked up and banned; one crawler request is enough to be checked later; a 2 s reverse zone given up after 0.2 s, three clients in under 1.5 s, logged with `-v`; the user agent cache, nothing tracked without a crawler list; `crawler_ua` default covers the usual crawlers and not a browser; config errors. Removing the timeout, or the claim, makes a test fail. |
 | `HoneyTest` | first hit bans now with `honey_ttl`, `rule=honey path=`, kept out of the window and path report; anchored patterns hit `/.env`, `/.git`, `/.git/config` and miss `/.github`, a nested `wp-login.php`, a query string; one ban per ttl; escalation and `max_ttl`; ttls above `max_ttl` capped with a warning, honey escalating from 900 once `max_ttl` is raised, no default above another (600, 900, 900); offenses shared with the other rules; `allow`, loopback, verified crawler, bad address exempt; wins over `skip`; a failed ban retried by the next probe; shown in `--review`; config: refused patterns, `honey_ttl` bounds only with honey paths |
 | `ExplainTest` | under, fires and BAN rows with their times, folded banned steps, summary; the same bans as a normal run; `under:` reasons (costly share, backend); allowlisted: never judged; verified crawler: exempt; honey, skipped, two profiles and a watch in one replay; watch ratio reason; not in the log; CLI: IPv6 normalized, the config's socket never used, bad address, refused with `-f` and `--review` |

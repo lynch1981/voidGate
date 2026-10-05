@@ -1,31 +1,54 @@
-# logban: ban costly-URL abusers from the nginx access log
+# logban: ban CC attackers, scanners and brute-forcers from the nginx access log
 
-Reads nginx's access log, finds clients that spend nearly all their
-requests on expensive endpoints (a CC flood), and drops them at XDP with
-`drop <ip> ttl=<sec>`. No Lua needed. Python 3.8+, standard library only.
+Reads nginx's access log, finds the clients attacking the site, and drops
+them at XDP with `drop <ip> ttl=<sec>`. No Lua needed. Python 3.8+,
+standard library only.
 
 Design, rules and trade-offs: [`doc/logban.md`](../../doc/logban.md).
 
-## Rule
+| Attack | What gives it away | Config |
+|---|---|---|
+| [CC attack](#cc-attacks) (HTTP flood on expensive URLs) | nearly all its requests are costly, or it keeps backend workers busy | `costly`, `ratio`, `max_backend_seconds`, profiles, clusters, attack mode |
+| [Scanning](#scanning) | probes for paths the site never serves; mostly 404s | `honey`, `watch scan` |
+| [Password brute force](#password-brute-force) | many failed logins from one address | `watch login` |
 
-Per address, over a 60 s sliding window judged every 10 s:
+Every rule is judged per address over a 60 s sliding window, every 10 s
+(honey paths at once). A ban lasts 60 s and doubles for each repeat, up
+to `max_ttl`: 15 minutes, so a mistake (a cleaned machine, a reassigned
+address) costs little and a repeat offender is just banned again
+([design §7.1](../../doc/logban.md#71-ttl)).
+
+## CC attacks
+
+The main job. A CC attack does not fill the NIC: a few hundred clients
+loop on one expensive URL (a search, a report, a login page) and exhaust
+the backend at a packet rate voidGate's flood policy never notices. A
+browser that searches also loads pages, CSS, JS and images; a bot
+flooding `/search` loads nothing else.
+
+A request is **costly** if its path matches a `costly` regex, or its
+backend time is at least `slow_seconds`. Find them with `--top-paths`
+([Run](#run)).
 
 | Rule | Fires when |
 |---|---|
 | `ratio` | at least 100 costly requests, and at least 90 % of all its requests |
 | `backend` | at least `max_backend_seconds` of backend time (off by default) |
-| `honey` | one request to a path the site never serves, banned at once |
-| a watch | requests by method, path and status: 404 scans, failed logins, 429s |
 | `cluster` | many addresses on one JA4 + user agent, nearly all costly: a wide, slow botnet (off by default, `cluster_min_addresses = 10`) |
+| `throttled` (a watch) | nginx's `limit_req` already refused it 30 times: move it to XDP |
 
-A request is costly if its path matches a `costly` regex, or its backend
-time is at least `slow_seconds`. A ban lasts 60 s and doubles for each
-repeat, up to `max_ttl`: 15 minutes, so a mistake (a cleaned machine, a
-reassigned address) costs little and a repeat offender is just banned
-again ([design §7.1](../../doc/logban.md#71-ttl)).
+```
+costly = ^/search
+costly = ^/api/report
+slow_seconds = 0.5
+min_costly = 100
+ratio = 0.9
+watch throttled = status:429     # set limit_req_status 429;
+throttled.max = 30
+```
 
-API clients have a ratio near 1.0 by design. Give them a profile with
-their own thresholds, chosen by user agent or path:
+**Apps and API clients** have a ratio near 1.0 by design. Give them a
+profile with their own thresholds, chosen by user agent or path:
 
 ```
 profile api = ua:^MyShop/
@@ -48,24 +71,62 @@ api_other.min_costly = 20
 JA4 picks thresholds, never a pass: fingerprints change with OS updates
 and can be copied ([design §5.5](../../doc/logban.md#55-ja4)).
 
-Honey paths catch scanners on their first probe:
+**Under attack**, tighten the volume thresholds while the whole site is
+loaded, and only then. The ratio is never scaled, so browsers still
+pass ([design §5.9](../../doc/logban.md#59-attack-mode)):
+
+```
+attack_requests = 20000          # site requests per window; above
+                                 # the "site peak" of --top-clients
+attack_scale = 0.5               # min_costly 100 -> 50
+```
+
+## Scanning
+
+Scanners probe for `.env`, `.git`, admin panels and old CMS paths. A
+**honey path** is one the site never serves and no page links to: one
+request bans at once, for 15 minutes:
 
 ```
 honey = ^/(wp-login\.php|xmlrpc\.php|\.env|\.git(/|$))
-honey_ttl = 900                  # the default, as long as max_ttl
+honey = ^/(phpmyadmin|pma|adminer)
 ```
 
-Watches count requests by method, path and status:
+Never list a path a page links to, even hidden: prefetchers and mail
+link scanners follow links. For the paths nobody listed, count 404s;
+the ratio lets a NAT address with a few broken images pass:
 
 ```
 watch scan = status:404
 scan.max = 50
 scan.ratio = 0.5                 # 404s must be half its requests
+```
+
+## Password brute force
+
+One address trying many passwords on the login form:
+
+```
 watch login = method:POST path:^/login$ status:401|403
 login.max = 20
-watch throttled = status:429     # set limit_req_status 429;
-throttled.max = 30
+login.ttl = 900                  # straight to the cap
 ```
+
+This only works if the app answers a failed login with the status the
+watch matches. Many answer 200 with an error page, or 302 back to the
+form, the same as a success. Then count every POST to the form instead:
+nobody submits it 20 times a minute, and the ratio lets an office
+address, whose users also load pages, pass:
+
+```
+watch login = method:POST path:^/login$
+login.max = 20
+login.ratio = 0.5
+```
+
+**Not caught:** credential stuffing spread over many addresses, a few
+attempts each, stays under any per-address count. That needs the app:
+rate limits per account, or a challenge.
 
 ## Log format
 
@@ -129,7 +190,8 @@ One line per ban:
 ```
 
 `logban.conf` documents every key: thresholds, `costly`, `profile`,
-`honey`, `watch`, `skip`, `allow`, `allow_file`, `crawler`, ttl.
+`honey`, `watch`, clusters, attack mode, `skip`, `allow`, `allow_file`,
+`crawler`, ttl.
 
 ## Behind Cloudflare
 

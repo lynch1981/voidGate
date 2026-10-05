@@ -1369,6 +1369,25 @@ class WatchTest(unittest.TestCase):
                      status=401)
         self.assertEqual(run(cfg, lines)[0].calls, [])
 
+    def test_login_any_status(self):
+        # an app that answers a failed login 200: count every POST, and
+        # let the ratio tell an office (its users load pages) apart
+        login = ("watch login = method:POST path:^/login$",
+                 "login.max = 20")
+        brute = hits("203.0.113.7", 30, path="/login", method="POST")
+        office = merge(hits("198.51.100.1", 30, path="/login",
+                            method="POST"),
+                       hits("198.51.100.1", 60, path="/", every=0.25))
+
+        act, out, _ = run(watch_config(*login, "login.ratio = 0.5"),
+                          merge(brute, office))
+        self.assertEqual(act.calls, [("203.0.113.7", 60)])
+        self.assertRegex(out, r"rule=login hits=2\d\n")
+
+        # without the ratio, the office is banned too
+        act, _, _ = run(watch_config(*login), office)
+        self.assertEqual(act.calls, [("198.51.100.1", 60)])
+
     def test_throttled(self):
         # nginx limit_req answering 429: escalate to XDP
         act, out, _ = run(watch_config(*THROTTLED),
