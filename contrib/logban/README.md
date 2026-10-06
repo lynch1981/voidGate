@@ -1,4 +1,4 @@
-# logban: ban CC attackers, scanners and brute-forcers from the nginx access log
+# logban: ban CC attackers, scanners and brute-forcers by reading the nginx access log
 
 Reads nginx's access log, finds the clients attacking the site, and drops
 them at XDP with `drop <ip> ttl=<sec>`. No Lua needed. Python 3.8+,
