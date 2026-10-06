@@ -52,6 +52,8 @@ def config(**kw):
         if k in logban.Config.LISTS:
             for x in v:
                 cfg.set(k, x)
+        elif k in logban.Profile.KEYS:
+            cfg.set("default." + k, str(v))
         else:
             setattr(cfg, k, v)
 
@@ -308,13 +310,26 @@ class ConfigTest(unittest.TestCase):
         cfg.load(os.path.join(here, "logban.conf"))
         self.assertEqual(len(cfg.costly), 3)
         self.assertEqual(cfg.slow_seconds, 0.5)
+        default = cfg.profiles[0]
+        self.assertEqual((default.min_costly, default.ratio,
+                          default.max_backend_seconds, default.attack_scale),
+                         (100, 0.9, 0.0, 0.5))
 
     def test_errors(self):
-        for text in ("bogus = 1\n", "window\n", "ratio = 2\n",
+        for text in ("bogus = 1\n", "window\n", "default.ratio = 2\n",
                      "costly = (\n", "allow = 300.0.0.0/8\n",
                      "ttl = 0\ncostly = x\n", "min_costly = 5\n"):
             with self.assertRaises(logban.ConfigError, msg=text):
                 self.load(text)
+
+        with self.assertRaisesRegex(logban.ConfigError,
+                                    "default is built in"):
+            self.load("costly = x\nprofile default = ua:x\n")
+
+        # the thresholds are the default profile's, not global keys
+        with self.assertRaisesRegex(logban.ConfigError,
+                                    "write default.ratio"):
+            self.load("costly = x\nratio = 0.5\n")
 
 
 class SocketTest(unittest.TestCase):
@@ -841,7 +856,8 @@ def api_config(**kw):
     lines = ["costly = ^/search", "costly = ^/api/search",
              "profile api = ua:^MyShop/", "api.ratio = off",
              "api.max_backend_seconds = 30"]
-    lines += ["%s = %s" % kv for kv in kw.items()]
+    lines += ["%s%s = %s" % ("default." if k in logban.Profile.KEYS
+                             else "", k, v) for k, v in kw.items()]
 
     for ln in lines:
         k, _, v = ln.partition("=")
@@ -884,10 +900,11 @@ class ProfileTest(unittest.TestCase):
 
         # ratio off everywhere and no backend rule: nothing can fire
         with self.assertRaises(logban.ConfigError):
-            ConfigTest.load(self, base + "ratio = off\n")
+            ConfigTest.load(self, base + "default.ratio = off\n")
 
         # default may judge nothing while a profile does
-        cfg = ConfigTest.load(self, "ratio = off\nprofile api = path:^/a"
+        cfg = ConfigTest.load(self, "default.ratio = off\n"
+                                    "profile api = path:^/a"
                                     "\napi.max_backend_seconds = 5\n")
         self.assertIsNone(cfg.profiles[0].ratio)
 
@@ -1904,12 +1921,14 @@ class AttackTest(unittest.TestCase):
     def test_config(self):
         cfg = ConfigTest.load(self, "costly = x\n")
         self.assertEqual((cfg.attack_requests, cfg.attack_backend_seconds,
-                          cfg.attack_hold, cfg.attack_scale, cfg.attack),
+                          cfg.attack_hold, cfg.profiles[0].attack_scale,
+                          cfg.attack),
                          (0, 0.0, 300, 0.5, False))
         cfg = ConfigTest.load(self, "costly = x\nattack_requests = 5000\n")
         self.assertTrue(cfg.attack)
 
-        for text in ("attack_scale = 0\n", "attack_scale = 1.5\n",
+        for text in ("default.attack_scale = 0\n",
+                     "default.attack_scale = 1.5\n",
                      "attack_requests = -1\n", "attack_hold = -1\n",
                      "attack_backend_seconds = -1\n",
                      "profile api = ua:x\napi.max_backend_seconds = 9\n"

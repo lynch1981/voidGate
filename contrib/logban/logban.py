@@ -8,7 +8,8 @@ Reads an nginx access log (combined format, optionally with rt= and urt=
 appended), scores every client address over a sliding window and pushes
 `drop <ip> ttl=<sec>` to voidGate's control socket. --dry-run only prints.
 
-A client is banned when, within the window:
+A client is banned when, within the window and with the thresholds of
+the profile its requests matched (default.* when none did):
 
     costly >= min_costly  and  costly / total >= ratio      (rule=ratio)
     backend seconds >= max_backend_seconds                   (rule=backend)
@@ -156,14 +157,23 @@ def parse_ratio(value):
 
 class Profile:
     """A set of thresholds, chosen per request by path, user agent or
-    JA4. Index 0 is "default": the global keys, for requests no profile
-    matched."""
+    JA4. Index 0 is "default", for requests no profile matched; the
+    others inherit the default.* keys they do not set."""
 
     KEYS = {
         "min_costly": int,
         "ratio": parse_ratio,
         "max_backend_seconds": float,
         "attack_scale": float,
+    }
+    # the default profile's keys when the config does not set them
+    DEFAULTS = {
+        "min_costly": 100,
+        "ratio": 0.9,
+        "max_backend_seconds": 0.0,
+        # Attack mode scales min_costly and max_backend_seconds by
+        # this; the ratio is not.
+        "attack_scale": 0.5,
     }
     NAME = re.compile(r"[a-z][a-z0-9_]*")
     FIELDS = {"path": 0, "ua": 1, "ja4": 2}
@@ -174,7 +184,7 @@ class Profile:
         self.prefix = "" if name == "default" else name + "."
         self.match = []             # (field index, regex), any one matches
         self.ja4 = set()            # ja4:^<fingerprint>$, matched as a set
-        self.keys = {}              # overrides of the global KEYS
+        self.keys = {}              # KEYS this profile sets
 
     def add(self, field, rx):
         # An allowlist is dozens of exact fingerprints: one set lookup
@@ -305,10 +315,7 @@ class Config:
     SCALARS = {
         "window": (int, 60),
         "step": (int, 10),
-        "min_costly": (int, 100),
-        "ratio": (parse_ratio, 0.9),
         "slow_seconds": (float, 0.0),
-        "max_backend_seconds": (float, 0.0),
         # A first ban is a minute: a false positive (a CGNAT address, a
         # browser near a threshold) costs one; a repeat offender doubles
         # up to max_ttl.
@@ -328,12 +335,10 @@ class Config:
         "cluster_member_min": (int, 3),
         # Attack mode: while the whole site's requests or backend seconds
         # in the window reach a threshold (0 = off), and attack_hold
-        # seconds after, min_costly and max_backend_seconds are scaled
-        # by attack_scale. The ratio is not.
+        # seconds after, each profile's attack_scale applies.
         "attack_requests": (int, 0),
         "attack_backend_seconds": (float, 0.0),
         "attack_hold": (int, 300),
-        "attack_scale": (float, 0.5),
         # Only a client whose user agent claims to be a crawler gets the
         # DNS check, each lookup capped at crawler_timeout seconds.
         "crawler_ua": (str, r"(?i)bot|crawl|spider|slurp|google"),
@@ -433,7 +438,11 @@ class Config:
         elif kind == "profile":
             field, sep, rx = value.partition(":")
 
-            if not Profile.NAME.fullmatch(name) or name == "default":
+            if name == "default":
+                raise ValueError("default is built in and matches what no"
+                                 " profile did: set default.<key>")
+
+            if not Profile.NAME.fullmatch(name):
                 raise ValueError("bad profile name %r" % name)
 
             if not sep or field not in Profile.FIELDS or not rx:
@@ -464,6 +473,9 @@ class Config:
             name, sub = key.split(".", 1)
             parse = Profile.KEYS.get(sub) or Watch.KEYS[sub]
             self.pending.append((name, sub, parse(value)))
+
+        elif key in Profile.KEYS:
+            raise ValueError("a profile key: write default.%s" % key)
 
         else:
             raise ValueError("unknown key")
@@ -573,21 +585,25 @@ class Config:
         any_costly = self.costly or self.slow_seconds > 0
         fires = []
 
+        default = self.profiles[0]
+
         for p in self.profiles:
             for key in Profile.KEYS:
-                setattr(p, key, p.keys.get(key, getattr(self, key)))
+                inherit = (Profile.DEFAULTS[key] if p is default
+                           else getattr(default, key))
+                setattr(p, key, p.keys.get(key, inherit))
 
             if p.ratio is not None and not 0 < p.ratio <= 1:
-                raise ConfigError("%sratio must be in (0, 1] or off"
-                                  % p.prefix)
+                raise ConfigError("%s.ratio must be in (0, 1] or off"
+                                  % p.name)
 
             if p.min_costly < 1:
-                raise ConfigError("%smin_costly must be at least 1"
-                                  % p.prefix)
+                raise ConfigError("%s.min_costly must be at least 1"
+                                  % p.name)
 
             if not 0 < p.attack_scale <= 1:
-                raise ConfigError("%sattack_scale must be in (0, 1]"
-                                  % p.prefix)
+                raise ConfigError("%s.attack_scale must be in (0, 1]"
+                                  % p.name)
 
             fire = ((p.ratio is not None and any_costly)
                     or p.max_backend_seconds > 0)

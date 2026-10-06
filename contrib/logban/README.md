@@ -41,14 +41,15 @@ backend time is at least `slow_seconds`. Find them with `--top-paths`
 costly = ^/search
 costly = ^/api/report
 slow_seconds = 0.5
-min_costly = 100
-ratio = 0.9
+default.min_costly = 100         # profile "default": requests no
+default.ratio = 0.9              # other profile matched
 watch throttled = status:429     # set limit_req_status 429;
 throttled.max = 30
 ```
 
 **Apps and API clients** have a ratio near 1.0 by design. Give them a
-profile with their own thresholds, chosen by user agent or path:
+profile with their own thresholds, chosen by user agent or path; keys
+it does not set are `default`'s:
 
 ```
 profile api = ua:^MyShop/
@@ -78,7 +79,7 @@ pass ([design §5.9](../../doc/logban.md#59-attack-mode)):
 ```
 attack_requests = 20000          # site requests per window; above
                                  # the "site peak" of --top-clients
-attack_scale = 0.5               # min_costly 100 -> 50
+default.attack_scale = 0.5       # min_costly 100 -> 50
 ```
 
 ## Scanning

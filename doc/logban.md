@@ -156,8 +156,8 @@ Config keys (`logban.conf` documents each one):
 |---|---|
 | `window`, `step` | §5.1 |
 | `costly`, `slow_seconds` | §5.2 |
-| `min_costly`, `ratio`, `max_backend_seconds` | §5.3 |
-| `profile <name>`, `<name>.min_costly`, `<name>.ratio`, `<name>.max_backend_seconds` | §5.4, §5.5 |
+| `default.min_costly`, `default.ratio`, `default.max_backend_seconds` | §5.3 |
+| `profile <name>`, `<name>.min_costly`, `<name>.ratio`, `<name>.max_backend_seconds`, `<name>.attack_scale` | §5.4, §5.5, §5.9 |
 | `honey`, `honey_ttl` | §5.6 |
 | `watch <name>`, `<name>.max`, `<name>.ratio`, `<name>.ttl` | §5.7 |
 | `cluster_min_addresses`, `cluster_min_costly`, `cluster_ratio`, `cluster_member_min` | §5.8 |
@@ -286,6 +286,16 @@ to see which paths cost the most backend time.
 
 ### 5.3 Rules
 
+`ratio` and `backend` read their thresholds from the request's profile
+(§5.4); `default.min_costly`, `default.ratio` and
+`default.max_backend_seconds` when no profile matched:
+
+```
+default.min_costly = 100
+default.ratio = 0.9
+default.max_backend_seconds = 0
+```
+
 | Rule | Fires when (defaults) | Catches |
 |---|---|---|
 | `ratio` | `costly >= min_costly` (100) **and** `costly / total >= ratio` (0.9; `off` turns it off) | bots looping on costly URLs |
@@ -319,8 +329,8 @@ api.max_backend_seconds = 30     # half a worker per address
 ```
 
 - **Chosen per request.** The first declared profile whose `path:`,
-  `ua:` or `ja4:` regex matches; `default` (the global keys) when none
-  does.
+  `ua:` or `ja4:` regex matches; `default` when none does. `default` is
+  always there, set with `default.<key>` lines and no match line.
 - **Counted apart.** The window is keyed by (address, profile). One NAT
   address with app users and browsers keeps two counters, so the app's
   costly calls do not push the browsers' ratio over the line.
@@ -332,8 +342,10 @@ api.max_backend_seconds = 30     # half a worker per address
   `api.max_backend_seconds` still bans it. That is why a profile cannot
   turn every rule off: a declared profile in which no rule can fire is a
   config error. `default` may judge nothing, if a profile does.
-- Overridable: `min_costly`, `ratio`, `max_backend_seconds`. What is
-  costly, the window and the ttl stay global.
+- **Keys:** `min_costly`, `ratio`, `max_backend_seconds`,
+  `attack_scale` (§5.9). A key a profile does not set is `default`'s.
+  What is costly, the window and the ttl stay global. A bare
+  `min_costly = 100` is refused: write `default.min_costly`.
 - **NAT adds up.** A NAT address carrying 30 app users uses 30 users'
   backend time. In a synthetic test, one app install peaked at 4.8 s
   (p99.9), a NAT with ~30 of them at 31.4 s, and a bot forging the app's
@@ -546,7 +558,7 @@ thresholds while the whole site is under load, and only then:
 attack_requests = 20000           # site requests in one window; 0 = off
 attack_backend_seconds = 0        # site backend seconds in one window; 0 = off
 attack_hold = 300                 # stays on this long after the last step over
-attack_scale = 0.5                # min_costly and max_backend_seconds times this
+default.attack_scale = 0.5        # min_costly and max_backend_seconds times this
 ```
 
 - **The signal is the log itself.** Every step, the site's requests and
@@ -556,15 +568,15 @@ attack_scale = 0.5                # min_costly and max_backend_seconds times thi
   traffic is load too), banned clients left out (live, XDP drops them,
   so a replay must not count them either). Off, nothing is counted.
 - **What tightens.** Every profile's `min_costly` (rounded up, at least
-  1) and `max_backend_seconds` are multiplied by `attack_scale`.
+  1) and `max_backend_seconds` are multiplied by its `attack_scale`.
   **The ratio is never scaled:** it is what lets browsers, CGNAT and
   office addresses pass (§5.3), and under load their mix of pages and
   assets is unchanged. A browser does not become a bot because the site
   is busy, so attack mode bans more bots, sooner, not more browsers.
 - **What does not.** Watches, honey paths and clusters keep their
   thresholds: they recognise a behaviour, not a volume.
-- **Per profile.** `<name>.attack_scale` overrides it, like the other
-  profile keys (§5.4). An app's users are judged by
+- **Per profile.** `<name>.attack_scale` overrides `default`'s, like
+  the other profile keys (§5.4). An app's users are judged by
   `max_backend_seconds` alone; `api.attack_scale = 1` keeps their limit
   when the site is busy, at the cost of a bot forging the app's user
   agent getting it too.
